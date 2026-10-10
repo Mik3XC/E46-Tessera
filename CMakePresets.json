@@ -1,0 +1,33 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "Local development",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "E46_BUILD_TOOLS": "OFF"
+      }
+    },
+    {
+      "name": "tools",
+      "inherits": "dev",
+      "displayName": "Local development with diagnostic tools",
+      "binaryDir": "${sourceDir}/build/tools",
+      "cacheVariables": {"E46_BUILD_TOOLS": "ON"}
+    },
+    {
+      "name": "sanitize",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/sanitize",
+      "cacheVariables": {"E46_SANITIZE": "ON"}
+    }
+  ],
+  "buildPresets": [
+    {"name": "dev", "configurePreset": "dev", "jobs": 2},
+    {"name": "tools", "configurePreset": "tools", "jobs": 2},
+    {"name": "sanitize", "configurePreset": "sanitize", "jobs": 2}
+  ]
+}
