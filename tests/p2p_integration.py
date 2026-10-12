@@ -20,15 +20,24 @@ parser.add_argument('--payment', type=Path)
 parser.add_argument('--mine-real', action='store_true', help='Also wait up to 30 minutes for a freshly mined block and its relay')
 args = parser.parse_args()
 node = str(args.node.resolve())
-cache = Path.home() / ('Library/Caches/E46Tessera' if os.uname().sysname == 'Darwin' else '.cache/E46Tessera')
-cache.mkdir(parents=True, exist_ok=True)
-root = Path(tempfile.mkdtemp(prefix='p2p-', dir=cache))
+# A short, test-only POSIX temporary path keeps Unix sockets within macOS limits.
+# Retain the exercise records/logs without using the node's default datadir.
+root = Path(tempfile.mkdtemp(prefix='e46-p2p-', dir='/tmp'))
 print(f'Exercise files: {root}', flush=True)
 processes = []
 logs = []
 
 
-def cli(directory, *words, ok=True):
+def assert_socket_path(directory):
+    assert len(os.fsencode((directory / 'control.sock').resolve())) < 100, 'Test socket path is too long'
+
+
+def cli(directory, *words, ok=True, allow_long_path=False):
+    if allow_long_path:
+        # Only the explicit overlong-path regression below opts out.
+        assert len(os.fsencode(directory / 'control.sock')) > 104
+    else:
+        assert_socket_path(directory)
     proc = subprocess.run([node, '--datadir', str(directory), *map(str, words)], text=True, capture_output=True, timeout=65)
     if ok and proc.returncode:
         raise AssertionError(f'{words[0]} failed: {proc.stderr}')
@@ -54,6 +63,7 @@ def port():
 
 
 def start(directory, p, remote=None):
+    assert_socket_path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     log = open(root / f'{directory.name}-{len(logs)}.log', 'w')
     logs.append(log)
@@ -134,8 +144,8 @@ try:
     longdir = root / ('long-' + 'x' * 80) / 'datadir'
     longdir.mkdir(parents=True)
     assert len(str(longdir / 'control.sock')) > 104
-    assert cli(longdir, 'mempool').startswith('transactions 0')
-    assert 'too long' in cli(longdir, 'serve', '--listen', f'127.0.0.1:{port()}', ok=False)
+    assert cli(longdir, 'mempool', allow_long_path=True).startswith('transactions 0')
+    assert 'too long' in cli(longdir, 'serve', '--listen', f'127.0.0.1:{port()}', ok=False, allow_long_path=True)
     milestone('long datadir path: one-shot commands work, serve refuses it clearly')
     a, b = root / 'a', root / 'b'
     pa, pb = port(), port()

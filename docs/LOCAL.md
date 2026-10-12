@@ -10,7 +10,7 @@ and two-node workflow.
 ```sh
 E46_NODE="$PWD/build/dev/e46-node"
 E46_WALLET="$PWD/build/dev/e46-wallet"
-E46_DATA="$HOME/Library/Caches/E46Tessera/experiment-01"
+E46_DATA="$HOME/E46Tessera-data/experiment-01"
 E46_WALLET_DIR="$HOME/E46Tessera-wallets"
 mkdir -p "$E46_WALLET_DIR"
 chmod 700 "$E46_WALLET_DIR"

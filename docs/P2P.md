@@ -20,20 +20,30 @@ chain state and exclusive datadir lock. Its default listener is
 `127.0.0.1:19446`; its default datadir on macOS is:
 
 ```text
-~/Library/Caches/E46Tessera
+~/Library/Application Support/E46Tessera
 ```
 
-On Linux the default is `$XDG_CACHE_HOME/E46Tessera`, or
-`~/.cache/E46Tessera` when that variable is unset. `--datadir DIR` overrides the
+On Linux the default is `$XDG_DATA_HOME/E46Tessera`, or
+`~/.local/share/E46Tessera` when that variable is unset. `--datadir DIR` overrides the
 default on both platforms. Relative paths are resolved from the working directory.
-The system can purge caches: use a durable explicit datadir for a long-lived
-seed node. Keep wallets, recovery phrases, passwords and fingerprints outside
-this cache. Existing `/private/tmp` stores are not automatically moved or changed.
+The default is durable application data, outside the OS cache. A newly created
+default datadir is owner-only (0700); explicit `--datadir` paths retain their
+existing permission behavior. Keep wallets, recovery phrases, passwords and
+fingerprints **outside the datadir**. Nothing is automatically moved or deleted.
+
+If the new default has no `blocks/` but the old cache location does, startup
+refuses and prints both paths. Use `--datadir "OLD_PATH"` to continue with that
+store, or stop the node and move the old datadir yourself to the new location.
+The guard checks `~/Library/Caches/E46Tessera` on macOS, and
+`~/.cache/E46Tessera` plus a configured `$XDG_CACHE_HOME/E46Tessera` on Linux.
+An existing block store at the new default takes precedence. Existing
+`/private/tmp` stores are not automatically moved or changed.
 
 `serve` needs the datadir path plus `/control.sock` to fit the operating system's
-Unix-socket path limit (104 bytes on macOS, 108 on Linux) and refuses a longer path
-with a clear message. One-shot commands such as `getblock` and `balance` work with
-any datadir path.
+Unix-socket path limit (under 104 bytes on macOS, under 108 on Linux) and refuses
+a longer path with a clear message. For a long home path, choose a short durable
+`--datadir` path. One-shot commands such as `getblock` and `balance` work with
+long datadir paths.
 
 In a second terminal:
 
@@ -55,14 +65,14 @@ commands still run once and exit; another active writer prevents a cold start.
 Terminal A:
 
 ```sh
-./build/dev/e46-node --datadir "$HOME/Library/Caches/E46Tessera/node-a" \
+./build/dev/e46-node --datadir "$HOME/E46Tessera-data/node-a" \
   serve --listen 127.0.0.1:19446
 ```
 
 Terminal B:
 
 ```sh
-./build/dev/e46-node --datadir "$HOME/Library/Caches/E46Tessera/node-b" \
+./build/dev/e46-node --datadir "$HOME/E46Tessera-data/node-b" \
   serve --listen 127.0.0.1:19447 --connect 127.0.0.1:19446
 ```
 
@@ -88,7 +98,7 @@ reconsidered. Invalid/conflicting spends are removed.
 ## Submit and mine while serving
 
 ```sh
-E46_DATA="$HOME/Library/Caches/E46Tessera/node-a"
+E46_DATA="$HOME/E46Tessera-data/node-a"
 E46_ADDRESS='REPLACE_WITH_YOUR_TESTNET_ADDRESS'
 E46_RAW=$(cat /path/to/public-signed-payment.tx.hex)
 ./build/dev/e46-node --datadir "$E46_DATA" submit "$E46_RAW"
@@ -195,8 +205,8 @@ Pi and Orange Pi builds remain pending identification of the board and OS;
 
 ## Reproduce the checks
 
-Standard-library Python only. The script uses independent cache datadirs,
-localhost ports and child daemons, and stops the daemons on exit. It retains its
+Standard-library Python only. The script uses test-only temporary datadirs under
+`/tmp`, localhost ports and child daemons, and stops the daemons on exit. It retains its
 logs and public records in the printed experiment directory for inspection.
 
 Basic handshake/control exercise without historical fixtures:
@@ -220,3 +230,10 @@ block and verify that a second node receives the same validated tip. Mining
 uses the unchanged consensus target; runtime depends on hardware and luck.
 
 See [the recorded local exercise](P2P-EXERCISE.md) for what was actually run.
+
+Default-directory and legacy migration checks use a temporary `HOME` and never
+access the operator's real default datadir:
+
+```sh
+python3 tests/datadir_defaults.py --node build/dev/e46-node
+```

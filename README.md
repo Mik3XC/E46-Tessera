@@ -50,7 +50,7 @@ mining, payment submission, and read-only inspection. Store wallets and chain
 data outside this repository.
 
 ```sh
-E46_DATA="$HOME/Library/Caches/E46Tessera/experiment-01"
+E46_DATA="$HOME/E46Tessera-data/experiment-01"
 ./build/dev/e46-node --datadir "$E46_DATA" snapshot 10
 ```
 

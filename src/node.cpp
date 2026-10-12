@@ -1434,11 +1434,24 @@ std::filesystem::path default_data_directory ()
     const auto *home = std::getenv("HOME");
     if (!home || !*home) throw std::runtime_error("HOME is unset; pass --datadir DIR");
 #ifdef __APPLE__
-    return std::filesystem::path(home) / "Library/Caches/E46Tessera";
+    const auto directory = std::filesystem::path(home) / "Library/Application Support/E46Tessera";
+    const std::vector<std::filesystem::path> legacy{std::filesystem::path(home) / "Library/Caches/E46Tessera"};
 #else
-    const auto *xdg = std::getenv("XDG_CACHE_HOME");
-    return (xdg && *xdg ? std::filesystem::path(xdg) : std::filesystem::path(home) / ".cache") / "E46Tessera";
+    const auto *xdg = std::getenv("XDG_DATA_HOME");
+    const auto directory = (xdg && *xdg ? std::filesystem::path(xdg)
+        : std::filesystem::path(home) / ".local/share") / "E46Tessera";
+    std::vector<std::filesystem::path> legacy{std::filesystem::path(home) / ".cache/E46Tessera"};
+    const auto *old_xdg = std::getenv("XDG_CACHE_HOME");
+    if (old_xdg && *old_xdg) legacy.emplace_back(std::filesystem::path(old_xdg) / "E46Tessera");
 #endif
+    if (!std::filesystem::exists(directory / "blocks"))
+        for (const auto &old : legacy)
+            if (std::filesystem::is_directory(old / "blocks"))
+                throw std::runtime_error("Legacy block store found at \"" + old.string()
+                    + "\"; new default \"" + directory.string() + "\" has no blocks/. Refusing to start. "
+                    "Use --datadir \"" + old.string() + "\", or stop the node and move the old datadir "
+                    "yourself to \"" + directory.string() + "\". Nothing was moved or deleted.");
+    return directory;
 }
 
 bool Node::has_block (const Digest &id) const { return impl_->entries.contains(id); }

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <fcntl.h>
@@ -20,6 +21,8 @@
 #include <stdexcept>
 #include <vector>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <system_error>
 #include <unistd.h>
 
 namespace
@@ -29,10 +32,18 @@ namespace
 class WriterLock
 {
 public:
-    WriterLock (const std::filesystem::path &directory, bool needed)
+    WriterLock (const std::filesystem::path &directory, bool needed, bool default_directory)
     {
         if (!needed) return;
-        std::filesystem::create_directories(directory);
+        if (default_directory)
+        {
+            std::filesystem::create_directories(directory.parent_path());
+            if (::mkdir(directory.c_str(), 0700) == 0)
+                std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+            else if (errno != EEXIST)
+                throw std::system_error(errno, std::generic_category(), "Cannot create default datadir");
+        }
+        else std::filesystem::create_directories(directory);
         fd_ = ::open((directory / "node-write.lock").c_str(), O_CREAT | O_RDWR, 0600);
         if (fd_ < 0) throw std::runtime_error("Cannot open the node writer lock");
         if (::flock(fd_, LOCK_EX | LOCK_NB) != 0)
@@ -395,7 +406,7 @@ int main(int argc, char **argv)
         if (args[0] == "status" || args[0] == "stop" || args[0] == "stop-mining")
             throw std::runtime_error("No daemon running in this datadir");
         // Even a read-only cold start can initialize genesis/recover state.
-        WriterLock writer(directory, true);
+        WriterLock writer(directory, true, first == 1);
         if (args[0] == "rebuild" && !std::filesystem::is_directory(directory / "blocks"))
             throw std::runtime_error("No block store to rebuild; use serve to synchronize a fresh datadir");
         e46::node::Node node(directory);
