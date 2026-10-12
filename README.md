@@ -3,12 +3,12 @@
 Experimental C++ node and command-line wallet for the E46 development testnet.
 
 Tessera implements a local proof-of-work chain, signed transactions, persistent
-pending transactions, and a JSON snapshot interface for explorers. Refracting
+pending transactions, manual peer synchronization/relay, and a JSON snapshot interface for explorers. Refracting
 Light v3 supplies the experimental proof-of-work hash; OpenSSL supplies SHAKE256,
 KMAC256, SLH-DSA signatures, and wallet cryptography.
 
-**Status:** local experiments. There is no peer-to-peer networking or supported
-mainnet deployment. This tree has no packaged releases. The experimental hash
+**Status:** local testnet experiments. A persistent P2P daemon is available;
+there is no supported mainnet deployment. This tree has no packaged releases. The experimental hash
 and protocol require independent review before production use.
 
 ## Build
@@ -32,7 +32,7 @@ The default build produces:
 
 | Program | Purpose |
 | --- | --- |
-| `e46-node` | Local chain, block validation, mining, mempool, snapshot JSON |
+| `e46-node` | Persistent peers, chain validation, mining, mempool, snapshot JSON |
 | `e46-wallet` | Wallet creation, fingerprints, addresses, signing, transaction display |
 | `addresses_cli` | Address encoding and decoding tools |
 | `transaction_cli` | Transaction serialization and validation tools |
@@ -42,12 +42,15 @@ preset. Dependencies are discovered locally; the build does not download them.
 
 ## Local use
 
+[P2P and rebuild guide](docs/P2P.md) covers persistent nodes, peer synchronization,
+relay, rebuilding and the two-node exercise.
+
 [Local experiment guide](docs/LOCAL.md) covers wallet creation, saved fingerprints,
 mining, payment submission, and read-only inspection. Store wallets and chain
 data outside this repository.
 
 ```sh
-E46_DATA="$HOME/E46Tessera-data/experiment-01"
+E46_DATA="$HOME/Library/Caches/E46Tessera/experiment-01"
 ./build/dev/e46-node --datadir "$E46_DATA" snapshot 10
 ```
 
@@ -68,7 +71,7 @@ No block store or wallet is bundled in this source tree.
 | Nominal block interval | 150 seconds, ASERT difficulty adjustment |
 | Mining-reward maturity | 100 blocks |
 | Block commitments | Separate transaction and event Merkle roots |
-| Current network scope | Single-machine Phase 1 testnet |
+| Current network scope | Manual-peer Phase 1 testnet |
 
 The wallet envelope's QTL construction and the chain's block-depth QTL commitments
 are distinct mechanisms. RAD events and stake-lock outputs are disabled in the

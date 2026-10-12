@@ -52,7 +52,7 @@ e46_library(block_qtl transaction rad merkle shake Threads::Threads)
 e46_library(genesis transaction header addresses merkle Threads::Threads)
 e46_library(qtl_v2 shake OpenSSL::Crypto)
 e46_library(node genesis transaction header emission block_qtl addresses merkle rl shake Threads::Threads)
-target_sources(node PRIVATE src/checkpoints.cpp)
+target_sources(node PRIVATE src/checkpoints.cpp src/p2p.cpp)
 
 function(e46_tool name source)
   add_executable(${name} tools/${source})

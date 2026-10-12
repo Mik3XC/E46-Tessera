@@ -99,7 +99,8 @@ undefined-behavior sanitizers when the selected compiler supports them.
 Use [docs/LOCAL.md](docs/LOCAL.md) for node and wallet commands. Data directories
 and wallet paths are explicit; choose Linux paths outside the checkout.
 
-- The node is a local CLI, with no P2P network or HTTP service.
+- The node has an experimental TCP peer daemon and local Unix control socket;
+  see [P2P operation](docs/P2P.md). There is no HTTP service.
 - A fresh store initializes the frozen genesis. Independently mined histories
   cannot cross the pinned height-268 block with a different ID.
 - Keep the saved wallet fingerprint separate from the wallet file.

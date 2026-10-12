@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,15 @@ public:
     // committed automatically and held until the required depth is reached.
     std::string submit (shake::Bytes serialized_transaction);
     std::vector<Digest> mempool_txids () const;
+    // Peer admission never starts QTL puzzle mining on behalf of an untrusted peer.
+    std::string submit_relay (shake::Bytes raw, const Digest &expected_id);
+    bool has_block (const Digest &id) const;
+    std::vector<Digest> locator (std::optional<Digest> cursor = {}) const;
+    std::optional<Digest> next_after (std::span<const Digest> locator) const;
+    std::vector<std::uint8_t> block_record (const Digest &id) const;
+    BlockInfo import_record (shake::Bytes raw);
+    // Independent header work; no shared Node state is accessed by the miner.
+    static bool solve (Block &block, std::stop_token stop);
 
     // Preview the next candidate without searching for proof of work or storing a block.
     Block block_template (const AddressPayload &miner) const;
@@ -77,5 +87,7 @@ private:
     Impl *impl_;
 };
 
+std::vector<std::uint8_t> encode_record (const Block &block);
+std::filesystem::path default_data_directory ();
 std::vector<std::uint8_t> serialize_block (const Block &block);
 } // namespace e46::node

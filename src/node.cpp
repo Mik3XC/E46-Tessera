@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "e46/node.hpp"
 #include "e46/checkpoints.hpp"
 #include "e46/addresses.hpp"
@@ -624,7 +625,7 @@ struct Node::Impl
         Block block{};
         block.header = chain::deserialize_header(reader.bytes(rl::header_bytes));
         const auto tx_count = reader.compact();
-        if (tx_count == 0 || tx_count > 4'000'000)
+        if (tx_count == 0 || tx_count > reader.remaining() / 60)
             throw std::invalid_argument("Invalid transaction count in block record");
         block.transactions.reserve(static_cast<std::size_t>(tx_count));
         const auto parent_it = entries.find(block.header.prev_block);
@@ -679,7 +680,7 @@ struct Node::Impl
             }
         }
         const auto event_count = reader.compact();
-        if (event_count > 4'000'000)
+        if (event_count > reader.remaining() / 3)
             throw std::invalid_argument("Invalid event count in block record");
         block.events.reserve(static_cast<std::size_t>(event_count));
         for (std::uint64_t i = 0; i < event_count; ++i)
@@ -1015,7 +1016,8 @@ struct Node::Impl
     }
 
     std::string submit_tx (Bytes raw, bool persist_entry = true,
-                           std::string_view expected_id = {})
+                           std::string_view expected_id = {}, bool allow_qtl_work = true,
+                           const std::optional<merkle::Event> *prepared_commit = nullptr)
     {
         if (raw.empty() || raw.size() > 4'000'000)
             throw std::invalid_argument("Submitted transaction size outside block limit");
@@ -1061,7 +1063,13 @@ struct Node::Impl
             }
             else
             {
-                entry.commit_event = block_qtl::mine_event(tx, block_qtl::provisional_z_commit, 4);
+                if (prepared_commit && *prepared_commit) entry.commit_event = *prepared_commit;
+                else
+                {
+                    if (!allow_qtl_work)
+                        throw std::invalid_argument("QTL relay requires an existing on-chain commitment");
+                    entry.commit_event = block_qtl::mine_event(tx, block_qtl::provisional_z_commit, 4);
+                }
             }
         }
         if (persist_entry) persist_pending(txid, raw);
@@ -1388,7 +1396,104 @@ BlockInfo Node::mine_on (const Digest &parent, const AddressPayload &miner,
 
 BlockInfo Node::accept (const Block &block, std::uint64_t adjusted_time)
 {
-    return impl_->accept_internal(block, adjusted_time, true);
+    const auto previous = impl_->best;
+    const auto result = impl_->accept_internal(block, adjusted_time, true);
+    if (impl_->best != previous)
+    {
+        // Revalidate pending spends after extensions/reorgs and resurrect ordinary
+        // transactions disconnected from the previous active branch.
+        auto pending = std::move(impl_->mempool);
+        impl_->mempool.clear();
+        impl_->mempool_spends.clear();
+        for (const auto &entry : pending)
+        {
+            try { (void)impl_->submit_tx(entry.raw, false, {}, false, &entry.commit_event); }
+            catch (const std::exception &) { impl_->erase_pending(transaction::txid(entry.tx)); }
+        }
+        auto old = previous;
+        std::set<Digest> active;
+        for (const auto &id : impl_->best_chain_ids()) active.insert(id);
+        while (!active.contains(old))
+        {
+            const auto &entry = impl_->entries.at(old);
+            for (std::size_t i = 1; i < entry.block.transactions.size(); ++i)
+            {
+                try { (void)impl_->submit_tx(transaction::serialize(entry.block.transactions[i]), true, {}, false); }
+                catch (const std::exception &) { /* Conflicting/non-final disconnected spend. */ }
+            }
+            old = entry.parent;
+        }
+    }
+    return result;
+}
+
+std::vector<std::uint8_t> encode_record (const Block &block) { return store_record(block); }
+
+std::filesystem::path default_data_directory ()
+{
+    const auto *home = std::getenv("HOME");
+    if (!home || !*home) throw std::runtime_error("HOME is unset; pass --datadir DIR");
+#ifdef __APPLE__
+    return std::filesystem::path(home) / "Library/Caches/E46Tessera";
+#else
+    const auto *xdg = std::getenv("XDG_CACHE_HOME");
+    return (xdg && *xdg ? std::filesystem::path(xdg) : std::filesystem::path(home) / ".cache") / "E46Tessera";
+#endif
+}
+
+bool Node::has_block (const Digest &id) const { return impl_->entries.contains(id); }
+std::string Node::submit_relay (shake::Bytes raw, const Digest &id)
+{
+    return impl_->submit_tx(raw, true, hex(id), false);
+}
+std::vector<std::uint8_t> Node::block_record (const Digest &id) const
+{
+    return store_record(impl_->entries.at(id).block);
+}
+BlockInfo Node::import_record (shake::Bytes raw)
+{
+    if (raw.size() > 4'100'000) throw std::invalid_argument("Block record exceeds transport limit");
+    return accept(impl_->decode_record(raw), now_seconds());
+}
+std::vector<Digest> Node::locator (std::optional<Digest> cursor) const
+{
+    auto current = cursor && has_block(*cursor) ? *cursor : tip_id();
+    std::vector<Digest> result;
+    std::uint64_t stride = 1;
+    while (true)
+    {
+        result.push_back(current);
+        if (impl_->entries.at(current).height == 0) break;
+        for (std::uint64_t j = 0; j < stride && impl_->entries.at(current).height != 0; ++j)
+            current = impl_->entries.at(current).parent;
+        if (result.size() > 10 && stride < (std::uint64_t{1} << 62)) stride *= 2;
+    }
+    return result;
+}
+std::optional<Digest> Node::next_after (std::span<const Digest> locator) const
+{
+    const auto ids = impl_->best_chain_ids();
+    for (const auto &id : locator)
+    {
+        const auto entry = impl_->entries.find(id);
+        if (entry == impl_->entries.end()) continue;
+        const auto height = entry->second.height;
+        if (height >= ids.size() || ids[height] != id) continue;
+        if (height + 1 == ids.size()) return {};
+        return ids[height + 1];
+    }
+    throw std::invalid_argument("Locator has no common ancestor");
+}
+bool Node::solve (Block &block, std::stop_token stop)
+{
+    const auto target = chain::compact_to_target(block.header.bits);
+    for (std::uint64_t nonce = 0; !stop.stop_requested(); ++nonce)
+    {
+        block.header.nonce = nonce;
+        if (rl::rl_v3_header_pow(chain::serialize_header(block.header), target)) return true;
+        if (nonce == UINT64_MAX) break;
+    }
+    return false;
 }
 
 } // namespace e46::node

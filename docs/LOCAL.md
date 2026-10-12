@@ -1,16 +1,16 @@
 # Local experiments
 
-Run the examples from the repository root. The node is a one-shot CLI: each
-invocation loads the local block store, performs a command, and exits. `mine`
-runs until the requested count is complete or you interrupt it. There is no
-background P2P daemon.
+Run the examples from the repository root. `serve` runs a persistent node.
+Other commands use its private control socket when it is running, or load the
+store and exit when it is not. See [P2P and rebuilding](P2P.md) for the daemon
+and two-node workflow.
 
 ## 1. Separate source, wallets, and chain data
 
 ```sh
 E46_NODE="$PWD/build/dev/e46-node"
 E46_WALLET="$PWD/build/dev/e46-wallet"
-E46_DATA="$HOME/E46Tessera-data/experiment-01"
+E46_DATA="$HOME/Library/Caches/E46Tessera/experiment-01"
 E46_WALLET_DIR="$HOME/E46Tessera-wallets"
 mkdir -p "$E46_WALLET_DIR"
 chmod 700 "$E46_WALLET_DIR"
@@ -97,10 +97,13 @@ E46_RAW=$(cat "$E46_TX_FILE")
 "$E46_NODE" --datadir "$E46_DATA" mine 1 "$E46_ADDRESS"
 ```
 
-Stop an existing miner before submitting. `ACCEPTED` means stored in the local
-mempool, not broadcast or confirmed. The template is labeled `NOT_MINED`. Check
-the transaction ID in that template before mining. Once mining returns a block
-height, inspect `getblock HEIGHT` for the transaction ID. `gettx TXID` also finds
+With a daemon, submission and inspection continue while mining runs in the
+background, and accepted ordinary transactions are announced to peers. Stop a
+standalone one-shot miner before submitting. `ACCEPTED` means stored in the
+mempool; it does not establish confirmation or delivery to every peer. The
+template is labeled `NOT_MINED`. Check the transaction ID in it, then inspect
+`getblock HEIGHT` after mining for actual inclusion. Daemon mining returns
+immediately; use `status` to track it. `gettx TXID` also finds
 pending transactions, so it alone does not establish confirmation.
 
 An already-confirmed payment has consumed its input. Resubmitting those same

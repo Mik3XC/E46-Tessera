@@ -13,6 +13,7 @@
 | `rad.cpp`, `block_qtl.cpp` | Puzzle and block-QTL support; phase policy is enforced by the node |
 | `qtl_v2.cpp` | Wallet-envelope cryptographic building blocks |
 | `node.cpp` | Block store, branch state, UTXOs, mempool, validation and local mining |
+| `p2p.cpp` | Bounded TCP peers, local control socket, background mining orchestration |
 | `checkpoints.cpp` | Explicit testnet block anchors |
 
 `tools/e46_node.cpp` handles the local CLI and explorer snapshot output.
@@ -46,8 +47,11 @@ cannot continue through this anchor. No historical block data is bundled here.
 Blocks are stored under `DATADIR/blocks/`. Accepted signed transactions are
 published to `DATADIR/mempool/<txid>.tx` before acceptance is reported. Startup
 revalidates the cache against the active chain; invalid entries are ignored.
-The CLI holds `node-write.lock` during submit/mining commands. This is a local
-writer lock, not a peer protocol or a transactional multi-process database.
+The daemon holds `node-write.lock` throughout its lifetime. Standalone commands
+also take the lock before loading the store. Local clients use the owner-only
+control socket while serving, so one process owns mutable chain state. This is
+not a transactional multi-process database. `rebuild` uses the normal startup
+replay; see [P2P and rebuilding](P2P.md).
 
 ## Boundaries
 
@@ -55,7 +59,8 @@ This is a source-only extraction for local development. GOLD files, independent
 Python reference implementations, historical test harnesses, research reports,
 Qt UI prototypes and web frontends remain in their separate working trees.
 
-The local node has no peer discovery, synchronization, remote RPC, or transaction
-broadcasting. Existing cryptographic primitives and passing development checks
+Manual TCP peers support synchronization and transaction/block relay. There is
+no automatic discovery or remote RPC. Transport v1 is specified in
+[P2P-WIRE.md](P2P-WIRE.md); limits and remaining scope are in [P2P.md](P2P.md). Existing cryptographic primitives and passing development checks
 do not establish the security of the custom proof-of-work construction or the
 complete protocol. No independent audit is claimed.

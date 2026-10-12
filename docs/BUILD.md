@@ -38,7 +38,8 @@ cmake --build --preset tools
 
 This source-only staging tree does not include the separate GOLD/differential
 test collection. Building is not a substitute for running those checks or
-reviewing consensus behavior. No test suite is registered here, and no release,
+reviewing consensus behavior. The new standalone Python P2P exercise is
+documented in [P2P.md](P2P.md); it is not run during a build. No release,
 packaging, installation, or publishing target is configured.
 
 Only ignored local build products are created. No wallets, mining jobs, or

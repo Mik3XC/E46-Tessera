@@ -1,5 +1,9 @@
 #include "e46/addresses.hpp"
 #include "e46/node.hpp"
+#include "e46/p2p.hpp"
+#include <fstream>
+#include <sstream>
+#include <csignal>
 #include "e46/rl.hpp"
 #include "e46/transaction.hpp"
 #include <algorithm>
@@ -34,7 +38,7 @@ public:
         if (::flock(fd_, LOCK_EX | LOCK_NB) != 0)
         {
             ::close(fd_); fd_ = -1;
-            throw std::runtime_error("Another node command is writing/mining in this datadir. Stop it before submitting or mining again.");
+            throw std::runtime_error("Another node process is using this datadir (a running daemon or another command). Stop it, or send commands to the running daemon, and try again.");
         }
     }
     ~WriterLock () { if (fd_ >= 0) ::close(fd_); }
@@ -94,7 +98,7 @@ e46::shake::Digest256 digest (std::string_view value)
 
 void usage ()
 {
-    std::cerr << "usage: e46-node --datadir DIR <getblock height|id|gettx txid|balance te46-address|submit tx-hex|mempool|template te46-address|mine count te46-address|snapshot [limit]>\n";
+    std::cerr << "usage: e46-node [--datadir DIR] <getblock height|id|gettx txid|balance te46-address|submit tx-hex|mempool|template te46-address|mine count te46-address|snapshot [limit]|serve [--listen HOST:PORT] [--connect HOST:PORT] [--max-peers N]|status|stop|stop-mining|import BLOCK.blk|rebuild>\n";
 }
 
 template <typename Left, typename Right>
@@ -185,7 +189,7 @@ void transaction_snapshot (const e46::node::Node &node, const e46::transaction::
               << ",\"serialized\":\"" << hex(raw) << "\"}";
 }
 
-void snapshot (const e46::node::Node &node, std::uint64_t limit)
+void snapshot (const e46::node::Node &node, std::uint64_t limit, bool p2p = false)
 {
     const auto tip = node.height();
     const auto first = limit > tip ? 0 : tip - limit + 1;
@@ -206,7 +210,7 @@ void snapshot (const e46::node::Node &node, std::uint64_t limit)
         if (!commitment_id.empty() || height == 0 || tip - height >= 2016) break;
     }
     std::cout << "{\"network\":\"E46-TESTNET\",\"phase\":1,\"radEnabled\":false,"
-              << "\"p2pEnabled\":false,\"height\":" << tip
+              << "\"p2pEnabled\":" << (p2p ? "true" : "false") << ",\"height\":" << tip
               << ",\"tipId\":\"" << hex(node.tip_id()) << "\",\"qtl\":";
     if (commitment_id.empty()) std::cout << "null";
     else std::cout << "{\"commitmentId\":\"" << commitment_id
@@ -264,18 +268,26 @@ void snapshot (const e46::node::Node &node, std::uint64_t limit)
 }
 } // namespace
 
-int main (int argc, char **argv)
+int dispatch(e46::node::Node &node, int argc, char **argv, bool p2p)
 {
-    try
+    const std::string_view command(argv[3]);
+    if (command == "rebuild" && argc == 4)
     {
-        if (argc < 4 || std::string_view(argv[1]) != "--datadir")
-        {
-            usage();
-            return 2;
-        }
-        const std::string_view command(argv[3]);
-        WriterLock writer{std::filesystem::path(argv[2]), command == "submit" || command == "mine"};
-        e46::node::Node node{std::filesystem::path(argv[2])};
+        std::cout << "REBUILT height " << node.height() << " tip " << hex(node.tip_id()) << '\n';
+        return 0;
+    }
+    if (command == "import" && argc == 5)
+    {
+        const auto size = std::filesystem::file_size(argv[4]);
+        if (size > 4'100'000) throw std::invalid_argument("Block record exceeds size limit");
+        std::ifstream stream(argv[4], std::ios::binary);
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+        if (!stream.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(size)))
+            throw std::runtime_error("Cannot read block record");
+        const auto info = node.import_record(bytes);
+        std::cout << "IMPORTED " << info.height << ' ' << hex(info.id) << '\n';
+        return 0;
+    }
         if (command == "mempool" && argc == 4)
         {
             const auto pending = node.mempool_txids();
@@ -296,7 +308,7 @@ int main (int argc, char **argv)
         }
         if (command == "snapshot" && (argc == 4 || argc == 5))
         {
-            snapshot(node, argc == 5 ? std::clamp(number(argv[4]), std::uint64_t{1}, std::uint64_t{64}) : 10);
+            snapshot(node, argc == 5 ? std::clamp(number(argv[4]), std::uint64_t{1}, std::uint64_t{64}) : 10, p2p);
             return 0;
         }
         if (command == "getblock" && argc == 5)
@@ -358,12 +370,62 @@ int main (int argc, char **argv)
                 std::cout << block.height << ' ' << hex(block.id) << '\n';
             return 0;
         }
-        usage();
-        return 2;
-    }
-    catch (const std::exception &error)
+    throw std::invalid_argument("Unknown command or argument count; run --help");
+}
+
+int main(int argc, char **argv)
+{
+    std::signal(SIGPIPE, SIG_IGN);
+    try
     {
-        std::cerr << "ERR " << error.what() << '\n';
-        return 1;
+        std::filesystem::path directory;
+        int first = 1;
+        if (argc > 1 && std::string_view(argv[1]) == "--datadir")
+        {
+            if (argc < 4) { usage(); return 2; }
+            directory = argv[2]; first = 3;
+        }
+        else directory = e46::node::default_data_directory();
+        if (first >= argc || std::string_view(argv[first]) == "--help") { usage(); return first >= argc ? 2 : 0; }
+        directory = std::filesystem::absolute(directory).lexically_normal();
+        std::vector<std::string> args;
+        for (int i = first; i < argc; ++i) args.emplace_back(argv[i]);
+        if (args[0] != "serve" && args[0] != "rebuild")
+            if (const auto answer = e46::p2p::request(directory, args)) { std::cout << *answer; return 0; }
+        if (args[0] == "status" || args[0] == "stop" || args[0] == "stop-mining")
+            throw std::runtime_error("No daemon running in this datadir");
+        // Even a read-only cold start can initialize genesis/recover state.
+        WriterLock writer(directory, true);
+        if (args[0] == "rebuild" && !std::filesystem::is_directory(directory / "blocks"))
+            throw std::runtime_error("No block store to rebuild; use serve to synchronize a fresh datadir");
+        e46::node::Node node(directory);
+        const auto execute = [&](const std::vector<std::string> &command) {
+            std::vector<std::string> values{"e46-node", "--datadir", directory.string()};
+            values.insert(values.end(), command.begin(), command.end());
+            std::vector<char *> pointers;
+            for (auto &value : values) pointers.push_back(value.data());
+            std::ostringstream output;
+            auto *previous = std::cout.rdbuf(output.rdbuf());
+            try { dispatch(node, static_cast<int>(pointers.size()), pointers.data(), args[0] == "serve"); }
+            catch (...) { std::cout.rdbuf(previous); throw; }
+            std::cout.rdbuf(previous);
+            return output.str();
+        };
+        if (args[0] == "serve")
+        {
+            e46::p2p::Options options;
+            for (std::size_t i = 1; i < args.size(); i += 2)
+            {
+                if (i + 1 >= args.size()) throw std::invalid_argument("Missing serve option value");
+                if (args[i] == "--listen") options.listen = args[i + 1];
+                else if (args[i] == "--connect") options.connect.push_back(args[i + 1]);
+                else if (args[i] == "--max-peers") options.max_peers = number(args[i + 1]);
+                else throw std::invalid_argument("Unknown serve option");
+            }
+            e46::p2p::serve(node, directory, options, execute);
+        }
+        else std::cout << execute(args);
+        return 0;
     }
+    catch (const std::exception &error) { std::cerr << "ERR " << error.what() << '\n'; return 1; }
 }
