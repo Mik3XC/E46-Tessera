@@ -63,8 +63,23 @@ that coinbase maturity delay.
 ## 4. Build a single-owner payment
 
 The wallet currently builds a one-input payment from an explicitly identified
-type-0 output. It checks ownership and creates change when needed. It does not
-automatically select UTXOs.
+type-0 output. It checks ownership and creates change when needed. The command-line
+wallet does not select coins itself; `utxos` lists them in the form `build` takes:
+
+```sh
+"$E46_NODE" --datadir "$E46_DATA" utxos "$E46_ADDRESS"
+```
+
+```text
+height 273
+coin TXID:INDEX:VALUE:0:PAYLOAD:IS_COINBASE:CREATION_HEIGHT spendable
+coin TXID:INDEX:VALUE:0:PAYLOAD:IS_COINBASE:CREATION_HEIGHT immature 69
+coin TXID:INDEX:VALUE:0:PAYLOAD:IS_COINBASE:CREATION_HEIGHT pending
+```
+
+`spendable` coins can go in the next block, at `height` + 1. `immature N` is a
+mining reward that needs N more blocks. `pending` is already spent by an accepted
+mempool transaction. Pass the field after `coin` to `build` unchanged.
 
 The spent-output descriptor has seven colon-separated fields:
 
@@ -100,7 +115,8 @@ E46_RAW=$(cat "$E46_TX_FILE")
 With a daemon, submission and inspection continue while mining runs in the
 background, and accepted ordinary transactions are announced to peers. Stop a
 standalone one-shot miner before submitting. `ACCEPTED` means stored in the
-mempool; it does not establish confirmation or delivery to every peer. The
+mempool; it does not establish confirmation or delivery to every peer. A
+`txid TXID` line follows it with the new transaction's ID. The
 template is labeled `NOT_MINED`. Check the transaction ID in it, then inspect
 `getblock HEIGHT` after mining for actual inclusion. Daemon mining returns
 immediately; use `status` to track it. `gettx TXID` also finds

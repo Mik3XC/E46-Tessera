@@ -26,6 +26,16 @@ struct Block
     std::vector<merkle::Event> events;
 };
 
+// One coin on the active chain, with what a wallet needs to spend it.
+struct OwnedCoin
+{
+    Digest txid{};
+    std::uint32_t index{};
+    transaction::SpentCoin coin;
+    std::uint64_t blocks_to_maturity{};  // 0 when it can be spent in the next block
+    bool pending_spend{};                // an accepted mempool transaction already spends it
+};
+
 struct BlockInfo
 {
     Block block;
@@ -49,6 +59,8 @@ public:
     Digest tip_id () const;
     emission::PoolBalances pool_balances () const;
     std::uint64_t balance (const AddressPayload &address) const;
+    // Coins paying this single-owner address on the active chain, for wallet coin selection.
+    std::vector<OwnedCoin> coins (const AddressPayload &address) const;
     BlockInfo get_block (std::uint64_t height) const;
     BlockInfo get_block (const Digest &id) const;
     std::optional<transaction::Transaction> get_transaction (const Digest &txid) const;

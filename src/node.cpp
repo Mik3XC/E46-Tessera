@@ -1330,6 +1330,25 @@ std::uint64_t Node::balance (const AddressPayload &address) const
     return total;
 }
 
+std::vector<OwnedCoin> Node::coins (const AddressPayload &address) const
+{
+    const auto &tip = impl_->active_tip();
+    const auto spending_height = tip.height + 1;
+    std::vector<OwnedCoin> result;
+    for (const auto &[outpoint, coin] : tip.state.utxos)
+    {
+        if (coin.output.type != 0x00 || coin.output.payload.size() != address.size() ||
+            !std::equal(coin.output.payload.begin(), coin.output.payload.end(), address.begin()))
+            continue;
+        OwnedCoin owned{outpoint.txid, outpoint.index, coin, 0, impl_->mempool_spends.contains(outpoint)};
+        // Same rule as transaction validation: a coinbase output needs 100 blocks.
+        if (coin.is_coinbase && spending_height < coin.creation_height + transaction::coinbase_maturity)
+            owned.blocks_to_maturity = coin.creation_height + transaction::coinbase_maturity - spending_height;
+        result.push_back(owned);
+    }
+    return result;
+}
+
 BlockInfo Node::get_block (std::uint64_t block_height) const
 {
     const auto chain_ids = impl_->best_chain_ids();

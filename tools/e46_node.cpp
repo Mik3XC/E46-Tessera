@@ -109,7 +109,7 @@ e46::shake::Digest256 digest (std::string_view value)
 
 void usage ()
 {
-    std::cerr << "usage: e46-node [--datadir DIR] <getblock height|id|gettx txid|balance te46-address|submit tx-hex|mempool|template te46-address|mine count te46-address|snapshot [limit]|serve [--listen HOST:PORT] [--connect HOST:PORT] [--max-peers N]|status|stop|stop-mining|import BLOCK.blk|rebuild>\n";
+    std::cerr << "usage: e46-node [--datadir DIR] <getblock height|id|gettx txid|balance te46-address|utxos te46-address|submit tx-hex|mempool|template te46-address|mine count te46-address|snapshot [limit]|serve [--listen HOST:PORT] [--connect HOST:PORT] [--max-peers N]|status|stop|stop-mining|import BLOCK.blk|rebuild>\n";
 }
 
 template <typename Left, typename Right>
@@ -367,10 +367,33 @@ int dispatch(e46::node::Node &node, int argc, char **argv, bool p2p)
             std::cout << node.balance(address) << '\n';
             return 0;
         }
+        if (command == "utxos" && argc == 5)
+        {
+            // One coin per line. The first field is the exact descriptor that
+            // `e46-wallet build` takes; the last says whether it can be spent now.
+            const auto address = e46::addresses::decode_single_owner_address(argv[4], e46::addresses::Network::testnet);
+            std::cout << "height " << node.height() << '\n';
+            for (const auto &owned : node.coins(address))
+            {
+                std::cout << "coin " << hex(owned.txid) << ':' << owned.index << ':' << owned.coin.output.value << ':'
+                          << static_cast<unsigned>(owned.coin.output.type) << ':' << hex(owned.coin.output.payload) << ':'
+                          << (owned.coin.is_coinbase ? 1 : 0) << ':' << owned.coin.creation_height << ' ';
+                if (owned.pending_spend) std::cout << "pending";
+                else if (owned.blocks_to_maturity) std::cout << "immature " << owned.blocks_to_maturity;
+                else std::cout << "spendable";
+                std::cout << '\n';
+            }
+            return 0;
+        }
         if (command == "submit" && argc == 5)
         {
             const auto raw = unhex(argv[4]);
+            const auto before = node.mempool_txids();
             std::cout << node.submit(raw) << '\n';
+            // Name the accepted transaction so wallets can show and track it.
+            for (const auto &id : node.mempool_txids())
+                if (std::find(before.begin(), before.end(), id) == before.end())
+                    std::cout << "txid " << hex(id) << '\n';
             return 0;
         }
         if (command == "mine" && argc == 6)
