@@ -443,6 +443,7 @@ struct Node::Impl
     struct MempoolEntry
     {
         transaction::Transaction tx;
+        Digest txid{};  // computed once on admission; lookups never rehash
         std::vector<std::uint8_t> raw;
         std::vector<OutPoint> inputs;
         bool qtl{};
@@ -460,6 +461,13 @@ struct Node::Impl
     std::uint64_t genesis_time{};
     std::uint32_t genesis_bits{chain::max_target_bits};
     std::optional<std::uint64_t> phase2_activation_height;
+    // txid -> (block, position) in every stored block on any branch, so a
+    // lookup never rescans or rehashes the chain (a peer's 1,000-ID inventory
+    // used to cost one full rescan per ID).
+    std::map<Digest, std::vector<std::pair<Digest, std::uint32_t>>> tx_index;
+    // The active chain, genesis first, rebuilt only when the tip changes.
+    mutable std::vector<Digest> active_cache;
+    mutable Digest active_cache_tip{};
 
     explicit Impl (std::filesystem::path directory) : data_directory(std::move(directory))
     {
@@ -709,6 +717,7 @@ struct Node::Impl
         const auto size = consensus_size(genesis_block);
         IndexEntry genesis_entry{genesis_block, id, {}, 0, work, std::move(state), size};
         entries.emplace(id, std::move(genesis_entry));
+        index_block(id);
         best = id;
         const auto path = blocks_directory / block_filename(0, id);
         if (!std::filesystem::exists(path))
@@ -958,25 +967,55 @@ struct Node::Impl
             persist(block, block_height, id);
         IndexEntry entry{block, id, parent.id, block_height, cumulative_work, std::move(next), size};
         auto inserted = entries.emplace(id, std::move(entry));
+        index_block(id);
         if (compare_work(inserted.first->second.chainwork, entries.at(best).chainwork) > 0)
             best = id;
         return make_info(inserted.first->second);
     }
 
-    std::vector<Digest> best_chain_ids () const
+    const std::vector<Digest> &best_chain_ids () const
     {
-        std::vector<Digest> result;
-        auto current = best;
-        while (true)
+        if (active_cache.empty() || active_cache_tip != best)
         {
-            result.push_back(current);
-            const auto &entry = entries.at(current);
-            if (entry.height == 0)
-                break;
-            current = entry.parent;
+            std::vector<Digest> result;
+            auto current = best;
+            while (true)
+            {
+                result.push_back(current);
+                const auto &entry = entries.at(current);
+                if (entry.height == 0)
+                    break;
+                current = entry.parent;
+            }
+            std::reverse(result.begin(), result.end());
+            active_cache = std::move(result);
+            active_cache_tip = best;
         }
-        std::reverse(result.begin(), result.end());
-        return result;
+        return active_cache;
+    }
+
+    void index_block (const Digest &id)
+    {
+        const auto &transactions = entries.at(id).block.transactions;
+        for (std::size_t i = 0; i < transactions.size(); ++i)
+            tx_index[transaction::txid(transactions[i])].emplace_back(id, static_cast<std::uint32_t>(i));
+    }
+
+    // The active-chain copy of a confirmed transaction, or nullptr.
+    const transaction::Transaction *active_transaction (const Digest &txid) const
+    {
+        const auto found = tx_index.find(txid);
+        if (found == tx_index.end())
+            return nullptr;
+        const auto &active = best_chain_ids();
+        for (const auto &[block_id, position] : found->second)
+        {
+            const auto &entry = entries.at(block_id);
+            const auto height = static_cast<std::size_t>(entry.height);
+            if (height < active.size() && active[height] == block_id)
+                return &entry.block.transactions[position];
+        }
+        return nullptr;
     }
 
     const IndexEntry &active_tip () const
@@ -1006,12 +1045,10 @@ struct Node::Impl
 
     bool known_transaction (const Digest &wanted) const
     {
-        for (const auto &id : best_chain_ids())
-            for (const auto &tx : entries.at(id).block.transactions)
-                if (transaction::txid(tx) == wanted)
-                    return true;
+        if (active_transaction(wanted))
+            return true;
         return std::any_of(mempool.begin(), mempool.end(), [&wanted] (const auto &entry) {
-            return transaction::txid(entry.tx) == wanted;
+            return entry.txid == wanted;
         });
     }
 
@@ -1050,6 +1087,7 @@ struct Node::Impl
 
         MempoolEntry entry{};
         entry.tx = tx;
+        entry.txid = txid;
         entry.raw.assign(raw.begin(), raw.end());
         entry.inputs = refs;
         entry.qtl = has_qtl_input(tx);
@@ -1274,7 +1312,7 @@ struct Node::Impl
                 continue;
             for (const auto &input : mempool[*it].inputs)
                 mempool_spends.erase(input);
-            erase_pending(transaction::txid(mempool[*it].tx));
+            erase_pending(mempool[*it].txid);
             mempool.erase(mempool.begin() + static_cast<std::ptrdiff_t>(*it));
         }
     }
@@ -1351,7 +1389,7 @@ std::vector<OwnedCoin> Node::coins (const AddressPayload &address) const
 
 BlockInfo Node::get_block (std::uint64_t block_height) const
 {
-    const auto chain_ids = impl_->best_chain_ids();
+    const auto &chain_ids = impl_->best_chain_ids();
     if (block_height >= chain_ids.size())
         throw std::out_of_range("Block height is above the active chain");
     return impl_->make_info(impl_->entries.at(chain_ids[static_cast<std::size_t>(block_height)]));
@@ -1367,12 +1405,10 @@ BlockInfo Node::get_block (const Digest &id) const
 
 std::optional<transaction::Transaction> Node::get_transaction (const Digest &txid) const
 {
-    for (const auto &id : impl_->best_chain_ids())
-        for (const auto &tx : impl_->entries.at(id).block.transactions)
-            if (transaction::txid(tx) == txid)
-                return tx;
+    if (const auto *tx = impl_->active_transaction(txid))
+        return *tx;
     for (const auto &entry : impl_->mempool)
-        if (transaction::txid(entry.tx) == txid)
+        if (entry.txid == txid)
             return entry.tx;
     return std::nullopt;
 }
@@ -1385,7 +1421,7 @@ std::string Node::submit (shake::Bytes serialized_transaction)
 std::vector<Digest> Node::mempool_txids () const
 {
     std::vector<Digest> result;
-    for (const auto &entry : impl_->mempool) result.push_back(transaction::txid(entry.tx));
+    for (const auto &entry : impl_->mempool) result.push_back(entry.txid);
     return result;
 }
 
@@ -1427,7 +1463,7 @@ BlockInfo Node::accept (const Block &block, std::uint64_t adjusted_time)
         for (const auto &entry : pending)
         {
             try { (void)impl_->submit_tx(entry.raw, false, {}, false, &entry.commit_event); }
-            catch (const std::exception &) { impl_->erase_pending(transaction::txid(entry.tx)); }
+            catch (const std::exception &) { impl_->erase_pending(entry.txid); }
         }
         auto old = previous;
         std::set<Digest> active;
@@ -1487,6 +1523,26 @@ BlockInfo Node::import_record (shake::Bytes raw)
     if (raw.size() > 4'100'000) throw std::invalid_argument("Block record exceeds transport limit");
     return accept(impl_->decode_record(raw), now_seconds());
 }
+void Node::check_peer_block (shake::Bytes raw) const
+{
+    if (raw.size() < 8 + rl::header_bytes)
+        throw std::invalid_argument("Truncated block record");
+    const auto header = chain::deserialize_header(raw.subspan(8, rl::header_bytes));
+    Digest parent{};
+    std::copy(header.prev_block.begin(), header.prev_block.end(), parent.begin());
+    const auto found = impl_->entries.find(parent);
+    if (found == impl_->entries.end() || parent == impl_->best)
+        return;  // unknown parents are rejected by acceptance; tip extensions are always welcome
+    const auto height = found->second.height + 1;
+    const auto active_height = impl_->active_tip().height;
+    for (const auto &checkpoint : checkpoints::testnet())
+        if (active_height >= checkpoint.height && height <= checkpoint.height)
+            throw std::invalid_argument("Side branch below the block-" + std::to_string(checkpoint.height) +
+                                        " checkpoint can never become active");
+    if (impl_->entries.size() - impl_->best_chain_ids().size() >= side_branch_budget)
+        throw std::invalid_argument("Side-branch storage budget reached (" + std::to_string(side_branch_budget) + " blocks)");
+}
+
 std::vector<Digest> Node::locator (std::optional<Digest> cursor) const
 {
     auto current = cursor && has_block(*cursor) ? *cursor : tip_id();
@@ -1504,7 +1560,7 @@ std::vector<Digest> Node::locator (std::optional<Digest> cursor) const
 }
 std::optional<Digest> Node::next_after (std::span<const Digest> locator) const
 {
-    const auto ids = impl_->best_chain_ids();
+    const auto &ids = impl_->best_chain_ids();
     for (const auto &id : locator)
     {
         const auto entry = impl_->entries.find(id);

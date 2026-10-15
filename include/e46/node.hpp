@@ -17,6 +17,8 @@
 namespace e46::node
 {
 using Digest = shake::Digest256;
+// Blocks off the active chain a node keeps from peers; active-chain blocks never count.
+inline constexpr std::size_t side_branch_budget = 512;
 using AddressPayload = addresses::Payload256;
 
 struct Block
@@ -76,6 +78,10 @@ public:
     std::optional<Digest> next_after (std::span<const Digest> locator) const;
     std::vector<std::uint8_t> block_record (const Digest &id) const;
     BlockInfo import_record (shake::Bytes raw);
+    // Storage policy for a block offered by a peer (not a consensus rule):
+    // throws if it is a side branch below a checkpoint the active chain already
+    // holds, or if side branches already use their whole storage budget.
+    void check_peer_block (shake::Bytes raw) const;
     // Independent header work; no shared Node state is accessed by the miner.
     static bool solve (Block &block, std::stop_token stop);
 

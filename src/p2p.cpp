@@ -477,6 +477,7 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
                     if (!node.has_block(id))
                     {
                         last_validation = now;  // only real validation work takes the global slot
+                        node.check_peer_block(data);  // no cheap side branches filling the store
                         require(stored_blocks < 4096, "Experimental stored-block limit reached");
                         const auto before = node.tip_id();
                         node.import_record(data); ++accepted_blocks; ++stored_blocks;

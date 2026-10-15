@@ -164,6 +164,8 @@ There is no validation bypass and no checkpoint bypass.
 | Outstanding requests per peer | One block and one transaction |
 | Mempool | 1,000 transactions / 64 MiB |
 | Stored blocks in daemon experiment | 4,096 including side branches |
+| Side-branch blocks from peers | 512; active-chain blocks never count against it |
+| Side branches below a held checkpoint | refused (they can never become active) |
 | Disk floor | Existing 1 GiB minimum free space |
 
 Types and declared lengths are checked before waiting for an entire frame.
@@ -179,15 +181,21 @@ validation costs, and review connection admission/peer diversity. This version
 has no transport encryption, peer authentication, address gossip, bans persisted
 across reconnects, automatic discovery, or public RPC.
 
-**Measured cost of one peer message (independent review, 12 Oct 2026).** On a
-274-block chain, one INVENTORY frame naming 1,000 unknown transaction IDs delays
-every other event-loop task by about 0.3 s, because each ID rescans the active
-chain and rehashes its transactions. Eight peers sending one frame each at the same
-moment delay it by about 2.2 s. The cost grows with chain length. A single connection
-cannot repeat it, because its pending-ID list is capped at 1,000 and drains slowly.
-This is acceptable for a loopback testnet and must be fixed before any public
-listener, for example with a transaction-ID index, or one known-ID set built per
-message.
+**Peer-message cost (measured 15 Oct 2026).** On the 274-block testnet, one
+INVENTORY frame naming 1,000 unknown transaction IDs used to delay every other
+event-loop task by about 0.3 s (2.1 s with eight peers at once), because each ID
+rescanned the active chain and rehashed its transactions. Transactions are now
+found through a txid index built once per stored block, the active chain is cached
+until the tip changes, and mempool entries keep their txid: the same frame costs
+about 0.01 s (0.007 s for eight peers), and the cost no longer grows with chain length.
+
+**Side branches (15 Oct 2026).** A peer could previously fill the 4,096-block store
+with side-branch blocks and stop the node accepting new active-chain blocks. Blocks
+offered by peers now face a storage policy (not a consensus rule): once the active
+chain holds a checkpoint, side branches at or below that height are refused, and
+side branches together may use at most 512 stored blocks. Extending the active tip
+is never refused by this policy. A legitimate competing branch is still followed
+until the budget is full.
 
 ## NAT and later hosting
 
