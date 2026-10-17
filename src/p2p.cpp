@@ -282,7 +282,7 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
         while (!peer.wanted_tx && !peer.wanted.empty())
         {
             const auto id = peer.wanted.front(); peer.wanted.pop_front();
-            if (node.get_transaction(id)) continue;
+            if (node.has_transaction(id)) continue;
             peer.wanted_tx = id; peer.tx_requested = Clock::now(); peer.queue(gettx, id);
         }
     };
@@ -488,7 +488,7 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
                     for (std::size_t n = 0; n < data.size() && peer.wanted.size() < 1000; n += 32)
                     {
                         const auto id = digest(e46::shake::Bytes(data).subspan(n, 32));
-                        if (!node.get_transaction(id) && peer.wanted_tx != id && std::find(peer.wanted.begin(), peer.wanted.end(), id) == peer.wanted.end()) peer.wanted.push_back(id);
+                        if (!node.has_transaction(id) && peer.wanted_tx != id && std::find(peer.wanted.begin(), peer.wanted.end(), id) == peer.wanted.end()) peer.wanted.push_back(id);
                     }
                     next_tx(peer);
                 }
@@ -507,7 +507,7 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
                     require(data.size() > 32, "Truncated transaction");
                     const auto id = digest(e46::shake::Bytes(data).first(32));
                     require(peer.wanted_tx == id, "Unsolicited transaction");
-                    if (!node.get_transaction(id))
+                    if (!node.has_transaction(id))
                     {
                         last_validation = now;  // only real validation work takes the global slot
                         node.submit_relay(e46::shake::Bytes(data).subspan(32), id); ++accepted_txs; announce(inventory, id, peer.socket.fd);

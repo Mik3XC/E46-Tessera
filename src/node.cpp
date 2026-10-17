@@ -1743,6 +1743,8 @@ std::optional<transaction::Transaction> Node::get_transaction (const Digest &txi
     return std::nullopt;
 }
 
+bool Node::has_transaction (const Digest &txid) const { return impl_->known_transaction(txid); }
+
 std::string Node::submit (shake::Bytes serialized_transaction)
 {
     return impl_->submit_tx(serialized_transaction);

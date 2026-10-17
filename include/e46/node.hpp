@@ -74,6 +74,9 @@ public:
     BlockInfo get_block (std::uint64_t height) const;
     BlockInfo get_block (const Digest &id) const;
     std::optional<transaction::Transaction> get_transaction (const Digest &txid) const;
+    // Membership only: confirmed on the active chain or pending. Never decodes a block,
+    // so peers can't make a known-txid INVENTORY cost one block decode per ID.
+    bool has_transaction (const Digest &txid) const;
 
     // Submit and persist a canonical serialized signed transaction. Block QTL spends are
     // committed automatically and held until the required depth is reached.
