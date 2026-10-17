@@ -259,6 +259,9 @@ keeps the current tip. A failed switch disconnects its partial changes and
 reconnects the original chain before returning an error. The failing block and
 its descendants are marked invalid and the reason is logged.
 
+Startup indexes all stored headers before choosing the strongest eligible chain
+for full replay. Losing side branches stay deferred, regardless of filename order.
+
 Local `rejected/` metadata binds previously rejected stored records to their
 exact bytes, so they remain excluded across restart without deleting evidence.
 A changed record or damaged rejection marker fails replay. Missing block parents,

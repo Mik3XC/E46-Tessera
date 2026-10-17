@@ -23,7 +23,7 @@ for i, words in enumerate(checks):
     (root / f'rollback-{i}-before.txt').write_bytes(before)
     (root / f'rollback-{i}-after.txt').write_bytes(after)
     assert before == after, words
-for name, expected in (('one', 2), ('deep', 3), ('invalid', 2)):
+for name, expected in (('one', 2), ('deep', 3), ('deferred', 3), ('invalid', 2)):
     snap = json.loads(cli(node, root / name, 'snapshot', '64'))
     assert snap['height'] == expected
     assert 'REBUILT height ' in cli(node, root / name, 'rebuild').decode()

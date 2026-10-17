@@ -205,6 +205,22 @@ void exercise(const Path &fixtures, const Path &root)
     }
     { n::Node node(root / "deep"); require(node.tip_id() == id(b3), "Deep reorg lost after restart"); }
     std::cout << "PASS two-block disconnect, three-block connect, balances and restart" << std::endl;
+    {
+        n::Node node(root / "deferred");
+        node.import_record(b1); node.import_record(b2); node.import_record(b3);
+        const auto attempts = node.storage_stats().validation_attempts;
+        node.import_record(bad2);
+        require(node.tip_id() == id(b3) && node.storage_stats().validation_attempts == attempts,
+                "Losing side branch was fully validated on admission");
+    }
+    {
+        n::Node node(root / "deferred");
+        require(node.tip_id() == id(b3) && node.storage_stats().validation_attempts == 3,
+                "Restart validated a losing side branch");
+        require(node.storage_stats().invalid_blocks == 0 && node.block_record(id(bad2)) == bad2,
+                "Deferred record was changed or classified without validation");
+    }
+    std::cout << "PASS restart indexes losing side branch without decoding or connecting it" << std::endl;
     { n::Node baseline(root / "baseline"); baseline.import_record(a1); baseline.import_record(a2); }
     std::string before;
     n::AddressPayload a{};

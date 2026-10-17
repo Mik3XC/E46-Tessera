@@ -572,7 +572,7 @@ struct Node::Impl
     std::uint64_t genesis_time{};
     std::uint32_t genesis_bits{chain::max_target_bits};
     std::optional<std::uint64_t> phase2_activation_height;
-    // txid -> (block, position) in every stored block on any branch, so a
+    // txid -> (block, position) in every fully validated block on any branch, so a
     // lookup never rescans or rehashes the chain (a peer's 1,000-ID inventory
     // used to cost one full rescan per ID).
     std::map<Digest, std::vector<std::pair<Digest, std::uint32_t>>> tx_index;
@@ -827,6 +827,7 @@ struct Node::Impl
                 paths.push_back(entry.path());
         }
         std::sort(paths.begin(), paths.end());
+        auto selected = best;
         for (const auto &path : paths)
         {
             const auto dash = path.filename().string().find('-');
@@ -842,10 +843,16 @@ struct Node::Impl
                     throw std::invalid_argument("Local store genesis differs from frozen testnet genesis");
                 continue;
             }
-            const auto result = accept_record(bytes, now_seconds(), false);
+            // Index all branch headers before choosing work. Filename order
+            // must not transiently activate a losing, unvalidated side branch.
+            const auto result = accept_record(bytes, now_seconds(), false, true);
             if (result.height != block_height || block_filename(result.height, result.id) != path.filename().string())
                 throw std::invalid_argument("Stored block path does not match validated contents");
+            const auto &entry = entries.at(result.id);
+            if (!entry.invalid && compare_work(entry.chainwork, entries.at(selected).chainwork) > 0)
+                selected = result.id;
         }
+        activate(selected, false);
     }
 
     BlockInfo make_info (const IndexEntry &entry) const
@@ -1211,7 +1218,8 @@ struct Node::Impl
         return size;
     }
 
-    BlockInfo accept_record (Bytes raw, std::uint64_t adjusted_time, bool write_record)
+    BlockInfo accept_record (Bytes raw, std::uint64_t adjusted_time, bool write_record,
+                             bool defer_activation = false)
     {
         const auto parts = record_parts(raw);
         const auto &header = parts.header;
@@ -1246,7 +1254,7 @@ struct Node::Impl
         if (write_record) check_disk_floor();
         auto &stored = entries.emplace(id, std::move(entry)).first->second;
         const auto original = best;
-        if (!stored.invalid) activate(id, write_record);
+        if (!stored.invalid && !defer_activation) activate(id, write_record);
         try
         {
             if (write_record) persist_raw(raw, height, id);
