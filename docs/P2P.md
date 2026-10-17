@@ -288,10 +288,12 @@ bytes. It binds only localhost and shuts down its child daemons.
 
 Generating reorg fixtures mines five blocks at the unchanged testnet target.
 It can take more than ten minutes; obtain operator approval first. The timeout
-below is a wall-clock cap for generation, and completed fixtures can be reused:
+below is a wall-clock cap for generation, and completed fixtures can be reused.
+The optional final argument selects 1–4 workers (default 1). On macOS, prefix
+the generation command with `caffeinate -i` to prevent idle sleep during mining:
 
 ```sh
-./build/dev/e46-storage-checks generate /tmp/branch-fixtures /path/to/copied-fixture 2700
+./build/dev/e46-storage-checks generate /tmp/branch-fixtures /path/to/copied-fixture 2700 4
 python3 tests/storage_reorg.py --tool build/dev/e46-storage-checks \
   --node build/dev/e46-node --fixtures /tmp/branch-fixtures --output /tmp/branch-check
 ```

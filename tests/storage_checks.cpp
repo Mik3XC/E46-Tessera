@@ -2,6 +2,7 @@
 #include "e46/header.hpp"
 #include "e46/addresses.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -56,8 +57,10 @@ void refresh_roots(n::Block &block)
     for (const auto &t : block.transactions) ids.push_back(tx::txid(t));
     block.header.merkle_root = e46::merkle::merkle_root(ids);
 }
-void generate(const Path &root, const Path &chain, unsigned seconds)
+void generate(const Path &root, const Path &chain, unsigned seconds, unsigned workers)
 {
+    require(seconds > 0, "Timeout must be positive");
+    require(workers >= 1 && workers <= 4, "Fixture miner supports 1..4 workers");
     std::filesystem::create_directories(root);
     write(root / "a1.blk", height_record(chain, 1));
     write(root / "a2.blk", height_record(chain, 2));
@@ -71,7 +74,10 @@ void generate(const Path &root, const Path &chain, unsigned seconds)
             require(n::encode_record(block) == cached && e46::chain::check_header_pow(block.header), "Bad cached proof of work");
             return;
         }
-        std::cout << "Mining " << name << " at unchanged testnet bits " << block.header.bits << std::endl;
+        require(std::chrono::steady_clock::now() < deadline,
+                "Mining deadline reached; completed fixtures retained for resume");
+        std::cout << "Mining " << name << " at unchanged testnet bits " << block.header.bits
+                  << " with " << workers << " workers" << std::endl;
         std::stop_source stop;
         std::jthread timer([&](std::stop_token finished) {
             while (!finished.stop_requested() && std::chrono::steady_clock::now() < deadline)
@@ -79,9 +85,31 @@ void generate(const Path &root, const Path &chain, unsigned seconds)
             if (!finished.stop_requested()) stop.request_stop();
         });
         const auto began = std::chrono::steady_clock::now();
-        const bool found = n::Node::solve(block, stop.get_token());
+        std::atomic<bool> found{false};
+        std::uint64_t winning_nonce = 0;
+        std::vector<std::jthread> miners;
+        for (unsigned worker = 0; worker < workers; ++worker)
+        {
+            miners.emplace_back([&, worker](std::stop_token finished) {
+                auto header = block.header;
+                for (std::uint64_t nonce = worker;
+                     !finished.stop_requested() && !stop.stop_requested() && !found.load();)
+                {
+                    header.nonce = nonce;
+                    if (e46::chain::check_header_pow(header))
+                    {
+                        if (!found.exchange(true)) winning_nonce = nonce;
+                        break;
+                    }
+                    if (nonce > UINT64_MAX - workers) break;
+                    nonce += workers;
+                }
+            });
+        }
+        for (auto &miner : miners) miner.join();
         timer.request_stop(); timer.join();
-        require(found, "Mining deadline reached; completed fixtures retained for resume");
+        require(found.load(), "Mining deadline reached; completed fixtures retained for resume");
+        block.header.nonce = winning_nonce;
         write(path, n::encode_record(block));
         std::cout << "MINED " << name << " nonce " << block.header.nonce << " seconds "
                   << std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count() << std::endl;
@@ -206,10 +234,12 @@ int main(int argc, char **argv)
 {
     try
     {
-        if (argc == 5 && std::string(argv[1]) == "generate") generate(argv[2], argv[3], static_cast<unsigned>(std::stoul(argv[4])));
+        if ((argc == 5 || argc == 6) && std::string(argv[1]) == "generate")
+            generate(argv[2], argv[3], static_cast<unsigned>(std::stoul(argv[4])),
+                     argc == 6 ? static_cast<unsigned>(std::stoul(argv[5])) : 1);
         else if (argc == 4 && std::string(argv[1]) == "exercise") exercise(argv[2], argv[3]);
         else if (argc == 3 && std::string(argv[1]) == "stats") { n::Node node(argv[2]); stats(node); }
-        else throw std::invalid_argument("usage: e46-storage-checks generate FIXTURES CHAIN TIMEOUT_SECONDS | exercise FIXTURES OUTPUT | stats DATADIR");
+        else throw std::invalid_argument("usage: e46-storage-checks generate FIXTURES CHAIN TIMEOUT_SECONDS [WORKERS=1] | exercise FIXTURES OUTPUT | stats DATADIR");
         return 0;
     }
     catch (const std::exception &error) { std::cerr << "FAIL " << error.what() << '\n'; return 1; }
