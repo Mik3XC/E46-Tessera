@@ -47,6 +47,13 @@ struct BlockInfo
     std::size_t serialized_size{};
 };
 
+// Storage diagnostics used by regression tools; no wire or CLI format changes.
+struct StorageStats
+{
+    std::size_t tip_coins{}, undo_saved_coins{}, undo_created_outputs{}, undo_records{}, indexed_blocks{}, invalid_blocks{};
+    std::uint64_t validation_attempts{};
+};
+
 class Node
 {
 public:
@@ -57,6 +64,7 @@ public:
     Node (const Node &) = delete;
     Node &operator=(const Node &) = delete;
 
+    StorageStats storage_stats () const;
     std::uint64_t height () const;
     Digest tip_id () const;
     emission::PoolBalances pool_balances () const;
@@ -93,6 +101,7 @@ public:
     // validation and fork tests.
     std::vector<BlockInfo> mine (std::uint64_t count, const AddressPayload &miner,
                                  std::uint32_t workers = 4);
+    // Only the active tip is supported; mine competing branches in separate datadirs.
     BlockInfo mine_on (const Digest &parent, const AddressPayload &miner,
                        std::uint32_t workers = 4,
                        std::optional<std::uint64_t> time = std::nullopt);

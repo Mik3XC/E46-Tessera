@@ -55,21 +55,36 @@ struct CommitAtHeight
 
 struct State
 {
+    State () = default;
+    State (const State &) = delete;
+    State &operator= (const State &) = delete;
     UtxoSet utxos;
     emission::PoolBalances pools;
     std::vector<std::uint64_t> recent_times;
     std::map<Commitment, std::vector<CommitAtHeight>> commitments;
 };
 
+// Only changes made by one active block; never a snapshot of its parent.
+struct Undo
+{
+    std::map<OutPoint, std::optional<transaction::SpentCoin>> coins;
+    emission::PoolBalances pools;
+    std::vector<std::uint64_t> recent_times;
+    std::vector<Commitment> commitments;
+};
+
 struct IndexEntry
 {
-    Block block;
+    chain::Header header;
+    std::vector<std::uint8_t> raw;
     Digest id{};
     Digest parent{};
     std::uint64_t height{};
     Work chainwork{};
-    State state;
+    emission::PoolBalances pools{};
     std::size_t size{};
+    bool validated{};
+    bool invalid{};
 };
 
 bool is_zero (const Digest &digest) noexcept
@@ -229,6 +244,99 @@ std::vector<OutPoint> transaction_inputs (Bytes bytes)
         inputs.push_back(outpoint);
     }
     return inputs;
+}
+
+struct RecordParts
+{
+    chain::Header header;
+    std::vector<Bytes> transactions;
+    std::vector<merkle::Event> events;
+};
+
+RecordParts record_parts (Bytes bytes)
+{
+    if (bytes.size() > 4'100'000)
+        throw std::invalid_argument("Block record exceeds transport limit");
+    Reader reader(bytes);
+    const auto magic = reader.bytes(store_magic.size());
+    if (!std::equal(magic.begin(), magic.end(), store_magic.begin()))
+        throw std::invalid_argument("Unknown local block store record version");
+    RecordParts result{};
+    result.header = chain::deserialize_header(reader.bytes(rl::header_bytes));
+    const auto count = reader.compact();
+    if (count == 0 || count > reader.remaining() / 60)
+        throw std::invalid_argument("Invalid transaction count in block record");
+    for (std::uint64_t i = 0; i < count; ++i)
+        result.transactions.push_back(reader.varbytes(4'000'000));
+    const auto events = reader.compact();
+    if (events > reader.remaining() / 3)
+        throw std::invalid_argument("Invalid event count in block record");
+    for (std::uint64_t i = 0; i < events; ++i)
+    {
+        merkle::Event event{};
+        event.type = reader.u8();
+        const auto id = reader.varbytes(32), body = reader.varbytes(256);
+        event.id.assign(id.begin(), id.end());
+        event.body.assign(body.begin(), body.end());
+        result.events.push_back(std::move(event));
+    }
+    if (!reader.empty()) throw std::invalid_argument("Trailing bytes after stored block record");
+    return result;
+}
+
+// Read a previously validated output directly from the transaction base. Its
+// witness does not need decoding to recover the output type for historical reads.
+transaction::Output recorded_output (Bytes raw, std::uint32_t index)
+{
+    Reader reader(raw);
+    (void)reader.u32();
+    const auto inputs = reader.compact();
+    if (inputs > reader.remaining() / 40) throw std::invalid_argument("Invalid stored input count");
+    (void)reader.bytes(static_cast<std::size_t>(inputs) * 40);
+    const auto count = reader.compact();
+    if (index >= count) throw std::invalid_argument("Stored output index out of bounds");
+    for (std::uint64_t i = 0; i <= index; ++i)
+    {
+        transaction::Output out{};
+        out.value = reader.u64(); out.type = reader.u8();
+        const auto payload = reader.varbytes(4'000'000);
+        if (i == index)
+        {
+            out.payload.assign(payload.begin(), payload.end());
+            return out;
+        }
+    }
+    throw std::logic_error("Unreachable stored output");
+}
+
+transaction::Transaction transaction_base (Bytes raw)
+{
+    Reader reader(raw);
+    transaction::Transaction tx{};
+    tx.version = reader.u32();
+    const auto inputs = reader.compact();
+    if (inputs == 0 || inputs > reader.remaining() / 40)
+        throw std::invalid_argument("Invalid transaction input count");
+    for (std::uint64_t i = 0; i < inputs; ++i)
+    {
+        transaction::Input input{};
+        const auto id = reader.bytes(32);
+        std::copy(id.begin(), id.end(), input.previous_txid.begin());
+        input.previous_index = reader.u32(); input.sequence = reader.u32();
+        tx.inputs.push_back(input);
+    }
+    const auto outputs = reader.compact();
+    if (outputs > reader.remaining() / 10) throw std::invalid_argument("Invalid transaction output count");
+    for (std::uint64_t i = 0; i < outputs; ++i)
+    {
+        transaction::Output out{};
+        out.value = reader.u64(); out.type = reader.u8();
+        const auto payload = reader.varbytes(4'000'000);
+        out.payload.assign(payload.begin(), payload.end());
+        tx.outputs.push_back(std::move(out));
+    }
+    tx.lock_time = reader.u64();
+    return tx;
 }
 
 std::size_t compact_size_bytes (std::uint64_t value)
@@ -456,6 +564,9 @@ struct Node::Impl
     std::filesystem::path mempool_directory;
     std::map<Digest, IndexEntry> entries;
     Digest best{};
+    State tip_state;
+    std::map<Digest, Undo> undo;
+    std::uint64_t validation_attempts{};
     std::vector<MempoolEntry> mempool;
     std::set<OutPoint> mempool_spends;
     std::uint64_t genesis_time{};
@@ -527,7 +638,7 @@ struct Node::Impl
         std::sort(paths.begin(), paths.end());
         std::set<std::string> confirmed;
         for (const auto &id : best_chain_ids())
-            for (const auto &tx : entries.at(id).block.transactions)
+            for (const auto &tx : historical_block(entries.at(id)).transactions)
                 confirmed.insert(hex(transaction::txid(tx)));
         for (const auto &path : paths)
         {
@@ -588,14 +699,13 @@ struct Node::Impl
             throw std::runtime_error("WO-17 disk safety stop: less than 1 GiB is available");
     }
 
-    void persist (const Block &block, std::uint64_t block_height, const Digest &id) const
+    void persist_raw (Bytes bytes, std::uint64_t block_height, const Digest &id) const
     {
         check_disk_floor();
         const auto final_path = blocks_directory / block_filename(block_height, id);
         if (std::filesystem::exists(final_path))
             return;
         const auto temporary_path = final_path.string() + ".tmp";
-        const auto bytes = store_record(block);
         {
             std::ofstream stream(temporary_path, std::ios::binary | std::ios::trunc);
             if (!stream)
@@ -624,86 +734,71 @@ struct Node::Impl
         return bytes;
     }
 
-    Block decode_record (Bytes bytes)
+    // Lookups into the tip plus a per-block overlay allow in-block spends
+    // without copying the complete coin set merely to decode witnesses.
+    Block decode_record (Bytes bytes, bool historical = false) const
     {
-        Reader reader(bytes);
-        const auto magic = reader.bytes(store_magic.size());
-        if (!std::equal(magic.begin(), magic.end(), store_magic.begin()))
-            throw std::invalid_argument("Unknown local block store record version");
-        Block block{};
-        block.header = chain::deserialize_header(reader.bytes(rl::header_bytes));
-        const auto tx_count = reader.compact();
-        if (tx_count == 0 || tx_count > reader.remaining() / 60)
-            throw std::invalid_argument("Invalid transaction count in block record");
-        block.transactions.reserve(static_cast<std::size_t>(tx_count));
-        const auto parent_it = entries.find(block.header.prev_block);
-        if (parent_it == entries.end())
-            throw std::invalid_argument("Stored block parent is unavailable");
-        State working = parent_it->second.state;
-        const auto child_height = parent_it->second.height + 1;
-        for (std::uint64_t tx_index = 0; tx_index < tx_count; ++tx_index)
+        const auto parts = record_parts(bytes);
+        Block block{parts.header, {}, parts.events};
+        const auto parent = entries.find(block.header.prev_block);
+        const auto child_height = parent == entries.end() ? 0 : parent->second.height + 1;
+        UtxoSet created;
+        std::set<OutPoint> consumed;
+        for (std::size_t i = 0; i < parts.transactions.size(); ++i)
         {
-            const auto raw = reader.varbytes(4'000'000);
+            const auto raw = parts.transactions[i];
             const auto refs = transaction_inputs(raw);
-            std::vector<transaction::SpentCoin> spent;
             const bool coinbase = refs.size() == 1 && refs[0].index == 0xffffffffU && is_zero(refs[0].txid);
+            std::vector<transaction::SpentCoin> spent;
             if (!coinbase)
-            {
-                spent.reserve(refs.size());
                 for (const auto &ref : refs)
                 {
-                    const auto found = working.utxos.find(ref);
-                    if (found == working.utxos.end())
+                    if (consumed.contains(ref))
                         throw std::invalid_argument("Stored transaction spends an unknown output");
-                    spent.push_back(found->second);
+                    const auto local = created.find(ref);
+                    if (local != created.end()) spent.push_back(local->second);
+                    else if (historical) spent.push_back(historical_coin(ref));
+                    else
+                    {
+                        const auto found = tip_state.utxos.find(ref);
+                        if (found == tip_state.utxos.end())
+                            throw std::invalid_argument("Stored transaction spends an unknown output");
+                        spent.push_back(found->second);
+                    }
                 }
-            }
             auto tx = transaction::deserialize(raw, spent);
+            if (i == 0 && !coinbase) throw std::invalid_argument("Stored block does not begin with coinbase");
+            if (!coinbase)
+                for (const auto &ref : refs) { created.erase(ref); consumed.insert(ref); }
+            const auto id = transaction::txid(tx);
+            for (std::size_t j = 0; j < tx.outputs.size(); ++j)
+                if (tx.outputs[j].type != 0x03)
+                {
+                    const OutPoint point{id, static_cast<std::uint32_t>(j)};
+                    if (historical || consumed.contains(point) || !tip_state.utxos.contains(point))
+                        created.emplace(point, transaction::SpentCoin{tx.outputs[j], coinbase, child_height});
+                    consumed.erase(point);
+                }
             block.transactions.push_back(std::move(tx));
-            if (tx_index == 0)
-            {
-                if (!coinbase)
-                    throw std::invalid_argument("Stored block does not begin with coinbase");
-                for (std::size_t output = 0; output < block.transactions.back().outputs.size(); ++output)
-                {
-                    const auto &coin = block.transactions.back().outputs[output];
-                    if (coin.type != 0x03)
-                        working.utxos.emplace(OutPoint{transaction::txid(block.transactions.back()),
-                            static_cast<std::uint32_t>(output)}, transaction::SpentCoin{coin, true, child_height});
-                }
-            }
-            else
-            {
-                const auto &decoded = block.transactions.back();
-                for (const auto &ref : refs)
-                    working.utxos.erase(ref);
-                const auto txid = transaction::txid(decoded);
-                for (std::size_t output = 0; output < decoded.outputs.size(); ++output)
-                {
-                    const auto &coin = decoded.outputs[output];
-                    if (coin.type != 0x03)
-                        working.utxos.emplace(OutPoint{txid, static_cast<std::uint32_t>(output)},
-                                               transaction::SpentCoin{coin, false, child_height});
-                }
-            }
         }
-        const auto event_count = reader.compact();
-        if (event_count > reader.remaining() / 3)
-            throw std::invalid_argument("Invalid event count in block record");
-        block.events.reserve(static_cast<std::size_t>(event_count));
-        for (std::uint64_t i = 0; i < event_count; ++i)
-        {
-            merkle::Event event{};
-            event.type = reader.u8();
-            const auto id = reader.varbytes(32);
-            const auto body = reader.varbytes(256);
-            event.id.assign(id.begin(), id.end());
-            event.body.assign(body.begin(), body.end());
-            block.events.push_back(std::move(event));
-        }
-        if (!reader.empty())
-            throw std::invalid_argument("Trailing bytes after stored block record");
         return block;
+    }
+
+    transaction::SpentCoin historical_coin (const OutPoint &ref) const
+    {
+        const auto found = tx_index.find(ref.txid);
+        if (found == tx_index.end()) throw std::invalid_argument("Historical transaction is unavailable");
+        const auto &[id, pos] = found->second.front();
+        const auto &entry = entries.at(id);
+        const auto parts = record_parts(entry.raw);
+        return {recorded_output(parts.transactions.at(pos), ref.index), pos == 0, entry.height};
+    }
+
+    Block historical_block (const IndexEntry &entry) const
+    {
+        if (!entry.validated || entry.invalid)
+            throw std::invalid_argument("Block is not fully validated");
+        return decode_record(entry.raw, true);
     }
 
     void initialize_genesis ()
@@ -711,17 +806,16 @@ struct Node::Impl
         const auto genesis_block = frozen_genesis();
         const auto header = chain::serialize_header(genesis_block.header);
         const auto id = addresses::block_id(header);
-        State state{};
-        state.recent_times.push_back(genesis_block.header.time);
+        tip_state.recent_times.push_back(genesis_block.header.time);
         const auto work = block_work(genesis_block.header.bits);
         const auto size = consensus_size(genesis_block);
-        IndexEntry genesis_entry{genesis_block, id, {}, 0, work, std::move(state), size};
+        IndexEntry genesis_entry{genesis_block.header, store_record(genesis_block), id, {}, 0, work, {}, size, true, false};
         entries.emplace(id, std::move(genesis_entry));
-        index_block(id);
+        index_block(id, genesis_block);
         best = id;
         const auto path = blocks_directory / block_filename(0, id);
         if (!std::filesystem::exists(path))
-            persist(genesis_block, 0, id);
+            persist_raw(entries.at(id).raw, 0, id);
     }
 
     void load_blocks ()
@@ -748,8 +842,7 @@ struct Node::Impl
                     throw std::invalid_argument("Local store genesis differs from frozen testnet genesis");
                 continue;
             }
-            const auto block = decode_record(bytes);
-            const auto result = accept_internal(block, now_seconds(), false);
+            const auto result = accept_record(bytes, now_seconds(), false);
             if (result.height != block_height || block_filename(result.height, result.id) != path.filename().string())
                 throw std::invalid_argument("Stored block path does not match validated contents");
         }
@@ -757,7 +850,7 @@ struct Node::Impl
 
     BlockInfo make_info (const IndexEntry &entry) const
     {
-        return {entry.block, entry.id, entry.height, entry.state.pools, entry.size};
+        return {historical_block(entry), entry.id, entry.height, entry.pools, entry.size};
     }
 
     std::optional<CommitAtHeight> find_commitment (const transaction::Transaction &tx,
@@ -810,7 +903,7 @@ struct Node::Impl
     }
 
     void add_outputs (State &state, const transaction::Transaction &tx,
-                      std::uint64_t height, bool coinbase) const
+                      std::uint64_t height, bool coinbase, Undo &changes) const
     {
         const auto txid = transaction::txid(tx);
         for (std::size_t i = 0; i < tx.outputs.size(); ++i)
@@ -820,157 +913,364 @@ struct Node::Impl
                 continue;
             if (output.type == 0x02 && !phase2_activation_height)
                 throw std::invalid_argument("Stake-lock output is disabled until Phase 2 activation");
+            remember_coin(changes, OutPoint{txid, static_cast<std::uint32_t>(i)});
             state.utxos.emplace(OutPoint{txid, static_cast<std::uint32_t>(i)},
                                 transaction::SpentCoin{output, coinbase, height});
         }
     }
 
-    BlockInfo accept_internal (const Block &block, std::uint64_t adjusted_time, bool write_record)
+    void remember_coin (Undo &changes, const OutPoint &point) const
     {
-        const auto parent_it = entries.find(block.header.prev_block);
-        if (parent_it == entries.end())
-            throw std::invalid_argument("Block parent is unknown");
-        const auto &parent = parent_it->second;
-        if (parent.height == UINT64_MAX)
-            throw std::overflow_error("Block height overflow");
-        const auto block_height = parent.height + 1;
-        const auto header_bytes = chain::serialize_header(block.header);
-        const auto id = addresses::block_id(header_bytes);
-        if (entries.contains(id))
-            throw std::invalid_argument("Block is already known");
+        if (changes.coins.contains(point)) return;
+        const auto found = tip_state.utxos.find(point);
+        changes.coins.emplace(point, found == tip_state.utxos.end()
+            ? std::nullopt : std::optional<transaction::SpentCoin>(found->second));
+    }
 
-        // Used for both stored-block replay and newly accepted/mined blocks.
-        // Parent validation ensures descendants also pass through this anchor.
-        checkpoints::validate_testnet(block_height, id);
-
-        const auto expected_bits = chain::asert_bits(genesis_bits, 0, genesis_time - chain::target_spacing,
-                                                      parent.height, parent.block.header.time);
-        if (block.header.bits != expected_bits)
-            throw std::invalid_argument("Block bits do not match ASERT");
-        if (!chain::check_block_time(block.header.time, parent.state.recent_times, adjusted_time))
-            throw std::invalid_argument("Block time violates median-time-past or future-time limit");
-        if (!chain::check_header_pow(block.header))
-            throw std::invalid_argument("Block proof of work is invalid");
-
-        const auto size = consensus_size(block);
-        if (block.transactions.empty() || !transaction::is_coinbase(block.transactions.front()))
-            throw std::invalid_argument("Block must begin with one coinbase transaction");
-        std::vector<Digest> txids;
-        std::vector<Digest> wtxids;
-        txids.reserve(block.transactions.size());
-        wtxids.reserve(block.transactions.size());
-        std::set<Digest> unique_txids;
-        for (const auto &tx : block.transactions)
+    void restore (const Undo &changes)
+    {
+        for (const auto &[point, coin] : changes.coins)
         {
-            const auto txid = transaction::txid(tx);
-            if (!unique_txids.insert(txid).second)
-                throw std::invalid_argument("Duplicate transaction ID in block");
-            txids.push_back(txid);
-            wtxids.push_back(transaction::wtxid(tx));
+            if (coin) tip_state.utxos.insert_or_assign(point, *coin);
+            else tip_state.utxos.erase(point);
         }
-        if (merkle::merkle_root(txids) != block.header.merkle_root)
-            throw std::invalid_argument("Transaction Merkle root mismatch");
+        for (auto it = changes.commitments.rbegin(); it != changes.commitments.rend(); ++it)
+        {
+            auto &values = tip_state.commitments.at(*it);
+            values.pop_back();
+            if (values.empty()) tip_state.commitments.erase(*it);
+        }
+        tip_state.pools = changes.pools;
+        tip_state.recent_times = changes.recent_times;
+    }
 
-        const auto &coinbase = block.transactions.front();
-        transaction::validate_coinbase(coinbase, block_height);
-        if (coinbase.outputs.empty())
-            throw std::invalid_argument("Coinbase has no witness commitment output");
+    std::vector<std::uint64_t> ancestor_times (Digest id) const
+    {
+        std::vector<std::uint64_t> times;
+        while (times.size() < 11)
+        {
+            const auto &entry = entries.at(id);
+            times.push_back(entry.header.time);
+            if (entry.height == 0) break;
+            id = entry.parent;
+        }
+        std::reverse(times.begin(), times.end());
+        return times;
+    }
+
+    void connect (IndexEntry &entry)
+    {
+        if (entry.invalid) throw std::invalid_argument("Block is known invalid");
+        if (entry.parent != best) throw std::logic_error("Connect must extend the active state");
+        ++validation_attempts;
+        const auto block = decode_record(entry.raw);
+        const auto block_height = entry.height;
+        Undo changes{};
+        changes.pools = tip_state.pools;
+        changes.recent_times = tip_state.recent_times;
+        changes.commitments.reserve(block.events.size());
+        try
+        {
+            const auto size = consensus_size(block);
+            if (block.transactions.empty() || !transaction::is_coinbase(block.transactions.front()))
+                throw std::invalid_argument("Block must begin with one coinbase transaction");
+            std::vector<Digest> txids;
+            std::vector<Digest> wtxids;
+            txids.reserve(block.transactions.size());
+            wtxids.reserve(block.transactions.size());
+            std::set<Digest> unique_txids;
+            for (const auto &tx : block.transactions)
+            {
+                const auto txid = transaction::txid(tx);
+                if (!unique_txids.insert(txid).second)
+                    throw std::invalid_argument("Duplicate transaction ID in block");
+                txids.push_back(txid);
+                wtxids.push_back(transaction::wtxid(tx));
+            }
+            if (merkle::merkle_root(txids) != block.header.merkle_root)
+                throw std::invalid_argument("Transaction Merkle root mismatch");
+
+            const auto &coinbase = block.transactions.front();
+            transaction::validate_coinbase(coinbase, block_height);
+            if (coinbase.outputs.empty())
+                throw std::invalid_argument("Coinbase has no witness commitment output");
+            const auto commitment = transaction::witness_commitment(wtxids);
+            const auto &last_output = coinbase.outputs.back();
+            if (last_output.type != 0x03 || last_output.value != 0 || last_output.payload.size() != commitment.size() ||
+                !std::equal(last_output.payload.begin(), last_output.payload.end(), commitment.begin()) ||
+                !transaction::has_witness_commitment(coinbase, commitment))
+                throw std::invalid_argument("Coinbase final output is not the unique witness commitment");
+
+            auto &next = tip_state;
+            add_outputs(next, coinbase, block_height, true, changes);
+            std::uint64_t fees = 0;
+            for (std::size_t tx_index = 1; tx_index < block.transactions.size(); ++tx_index)
+            {
+                const auto &tx = block.transactions[tx_index];
+                if (transaction::is_coinbase(tx))
+                    throw std::invalid_argument("A block may contain only one coinbase");
+                std::vector<transaction::SpentCoin> spent;
+                spent.reserve(tx.inputs.size());
+                std::set<OutPoint> used;
+                std::uint64_t input_value = 0;
+                for (const auto &input : tx.inputs)
+                {
+                    const OutPoint outpoint{input.previous_txid, input.previous_index};
+                    if (!used.insert(outpoint).second)
+                        throw std::invalid_argument("Transaction repeats an input outpoint");
+                    const auto found = next.utxos.find(outpoint);
+                    if (found == next.utxos.end())
+                        throw std::invalid_argument("Transaction spends an unknown or already-spent output");
+                    if (found->second.output.type == 0x02 && !phase2_activation_height)
+                        throw std::invalid_argument("Stake-lock outputs are disabled until Phase 2 activation");
+                    checked_sum(input_value, found->second.output.value);
+                    spent.push_back(found->second);
+                }
+                transaction::validate_transaction(tx, spent, block_height);
+                validate_tx_lock(tx, tip_state, block_height);
+                if (has_qtl_input(tx) && !find_commitment(tx, tip_state, block_height))
+                    throw std::invalid_argument("Block QTL reveal has no matching commitment at valid depth");
+                const auto output_value = output_total(tx.outputs);
+                if (output_value > input_value)
+                    throw std::invalid_argument("Transaction outputs exceed its inputs");
+                checked_sum(fees, input_value - output_value);
+                for (const auto &output : tx.outputs)
+                {
+                    if (output.type == 0x02 && !phase2_activation_height)
+                        throw std::invalid_argument("Stake-lock output is disabled until Phase 2 activation");
+                }
+                for (const auto &input : tx.inputs)
+                {
+                    const OutPoint point{input.previous_txid, input.previous_index};
+                    remember_coin(changes, point);
+                    next.utxos.erase(point);
+                }
+                add_outputs(next, tx, block_height, false, changes);
+            }
+
+            const auto reward = emission::reward_at(block_height);
+            const auto shares = emission::split_reward(reward);
+            const auto expected_miner_value = shares.miner + fees;
+            if (expected_miner_value > transaction::max_amount || output_total(coinbase.outputs) != expected_miner_value)
+                throw std::invalid_argument("Coinbase does not pay exactly the Phase-1 miner share plus fees");
+            next.pools = emission::accrue_pools(tip_state.pools, reward);
+
+            const auto ordered = merkle::sorted_events(block.events);
+            if (ordered.size() != block.events.size())
+                throw std::invalid_argument("Event sorting changed event count");
+            for (std::size_t i = 0; i < ordered.size(); ++i)
+            {
+                if (ordered[i].type != block.events[i].type || ordered[i].id != block.events[i].id ||
+                    ordered[i].body != block.events[i].body)
+                    throw std::invalid_argument("Block events are not in canonical (type, ID) order");
+                if (ordered[i].type == 0x02)
+                    throw std::invalid_argument("Rad events are disabled until Phase 2 activation");
+                if (ordered[i].type != block_qtl::event_type)
+                    throw std::invalid_argument("Unknown block event type");
+            }
+            block_qtl::validate_block_events(block.events, block_qtl::provisional_z_commit);
+            if (merkle::event_root(block.events) != block.header.event_root)
+                throw std::invalid_argument("Block event_root mismatch");
+            for (const auto &event : block.events)
+            {
+                if (event.type == block_qtl::event_type)
+                {
+                    Commitment key{};
+                    std::copy(event.id.begin(), event.id.end(), key.begin());
+                    next.commitments[key].push_back({event, block_height});
+                    changes.commitments.push_back(key);
+                }
+            }
+            next.recent_times.push_back(block.header.time);
+            if (next.recent_times.size() > 11)
+                next.recent_times.erase(next.recent_times.begin(), next.recent_times.end() - 11);
+
+
+            entry.pools = tip_state.pools;
+            entry.size = size;
+            if (!entry.validated) index_block(entry.id, block);
+            entry.validated = true;
+            undo.emplace(entry.id, std::move(changes));
+            best = entry.id;
+        }
+        catch (...)
+        {
+            restore(changes);
+            throw;
+        }
+    }
+
+    void disconnect ()
+    {
+        const auto previous = entries.at(best).parent;
+        restore(undo.at(best));
+        undo.erase(best);
+        best = previous;
+    }
+
+    std::filesystem::path rejection_path (const Digest &id) const
+    {
+        return data_directory / "rejected" / (hex(id) + ".txt");
+    }
+
+    void mark_invalid (const Digest &failed, const std::string &reason, bool persist_rejection)
+    {
+        for (auto &[id, entry] : entries)
+        {
+            auto cursor = id;
+            while (entries.at(cursor).height && cursor != failed) cursor = entries.at(cursor).parent;
+            if (cursor != failed) continue;
+            entry.invalid = true;
+            if (persist_rejection && std::filesystem::exists(blocks_directory / block_filename(entry.height, id)))
+            {
+                // Bind local rejection metadata to the exact raw record. A later
+                // damaged record must fail replay, not be silently excluded.
+                const auto path = rejection_path(id);
+                std::filesystem::create_directories(path.parent_path());
+                std::ofstream out(path, std::ios::trunc);
+                out << hex(shake::shake256_tagged_256("E46-rejected-record", entry.raw)) << '\n';
+                out.flush();
+                if (!out) throw std::runtime_error("Cannot preserve rejected branch metadata");
+            }
+        }
+        std::cerr << "Rejected branch " << hex(failed) << ": " << reason << '\n';
+    }
+
+    void activate (const Digest &target, bool persist_rejection, bool restoring = false)
+    {
+        if (!restoring && compare_work(entries.at(target).chainwork, entries.at(best).chainwork) <= 0) return;
+        const auto original = best;
+        auto left = best, right = target;
+        std::vector<Digest> old_chain, new_chain;
+        while (left != right)
+        {
+            if (entries.at(left).height >= entries.at(right).height)
+            { old_chain.push_back(left); left = entries.at(left).parent; }
+            else
+            { new_chain.push_back(right); right = entries.at(right).parent; }
+        }
+        const auto fork = left;
+        for (std::size_t i = 0; i < old_chain.size(); ++i) disconnect();
+        Digest connecting = target;
+        try
+        {
+            for (auto it = new_chain.rbegin(); it != new_chain.rend(); ++it)
+            { connecting = *it; connect(entries.at(*it)); }
+        }
+        catch (const std::exception &error)
+        {
+            const std::string reason = error.what();
+            while (best != fork) disconnect();
+            for (auto it = old_chain.rbegin(); it != old_chain.rend(); ++it) connect(entries.at(*it));
+            if (best != original) throw std::logic_error("Branch rollback did not restore the original tip");
+            mark_invalid(connecting, reason, persist_rejection);
+            throw std::invalid_argument("Invalid competing branch: " + reason);
+        }
+    }
+
+    std::size_t check_body_without_coins (const RecordParts &parts, std::uint64_t height) const
+    {
+        std::vector<Digest> txids, wtxids;
+        std::set<Digest> unique;
+        std::size_t size = rl::header_bytes + compact_size_bytes(parts.transactions.size()) + compact_size_bytes(parts.events.size());
+        for (std::size_t i = 0; i < parts.transactions.size(); ++i)
+        {
+            const auto raw = parts.transactions[i];
+            const auto base = transaction_base(raw);
+            if (transaction::is_coinbase(base) != (i == 0))
+                throw std::invalid_argument("Block must begin with exactly one coinbase");
+            const auto id = transaction::txid(base);
+            if (!unique.insert(id).second) throw std::invalid_argument("Duplicate transaction ID in block");
+            txids.push_back(id); wtxids.push_back(addresses::wtxid(raw));
+            size += raw.size();
+        }
+        if (merkle::merkle_root(txids) != parts.header.merkle_root)
+            throw std::invalid_argument("Transaction Merkle root mismatch");
+        const auto coinbase = transaction::deserialize(parts.transactions.front());
+        transaction::validate_coinbase(coinbase, height);
         const auto commitment = transaction::witness_commitment(wtxids);
-        const auto &last_output = coinbase.outputs.back();
-        if (last_output.type != 0x03 || last_output.value != 0 || last_output.payload.size() != commitment.size() ||
-            !std::equal(last_output.payload.begin(), last_output.payload.end(), commitment.begin()) ||
+        if (coinbase.outputs.empty()) throw std::invalid_argument("Coinbase has no witness commitment output");
+        const auto &last = coinbase.outputs.back();
+        if (last.type != 0x03 || last.value != 0 || last.payload.size() != commitment.size() ||
+            !std::equal(last.payload.begin(), last.payload.end(), commitment.begin()) ||
             !transaction::has_witness_commitment(coinbase, commitment))
             throw std::invalid_argument("Coinbase final output is not the unique witness commitment");
-
-        State next = parent.state;
-        add_outputs(next, coinbase, block_height, true);
-        std::uint64_t fees = 0;
-        for (std::size_t tx_index = 1; tx_index < block.transactions.size(); ++tx_index)
-        {
-            const auto &tx = block.transactions[tx_index];
-            if (transaction::is_coinbase(tx))
-                throw std::invalid_argument("A block may contain only one coinbase");
-            std::vector<transaction::SpentCoin> spent;
-            spent.reserve(tx.inputs.size());
-            std::set<OutPoint> used;
-            std::uint64_t input_value = 0;
-            for (const auto &input : tx.inputs)
-            {
-                const OutPoint outpoint{input.previous_txid, input.previous_index};
-                if (!used.insert(outpoint).second)
-                    throw std::invalid_argument("Transaction repeats an input outpoint");
-                const auto found = next.utxos.find(outpoint);
-                if (found == next.utxos.end())
-                    throw std::invalid_argument("Transaction spends an unknown or already-spent output");
-                if (found->second.output.type == 0x02 && !phase2_activation_height)
-                    throw std::invalid_argument("Stake-lock outputs are disabled until Phase 2 activation");
-                checked_sum(input_value, found->second.output.value);
-                spent.push_back(found->second);
-            }
-            transaction::validate_transaction(tx, spent, block_height);
-            validate_tx_lock(tx, parent.state, block_height);
-            if (has_qtl_input(tx) && !find_commitment(tx, parent.state, block_height))
-                throw std::invalid_argument("Block QTL reveal has no matching commitment at valid depth");
-            const auto output_value = output_total(tx.outputs);
-            if (output_value > input_value)
-                throw std::invalid_argument("Transaction outputs exceed its inputs");
-            checked_sum(fees, input_value - output_value);
-            for (const auto &output : tx.outputs)
-            {
-                if (output.type == 0x02 && !phase2_activation_height)
-                    throw std::invalid_argument("Stake-lock output is disabled until Phase 2 activation");
-            }
-            for (const auto &input : tx.inputs)
-                next.utxos.erase(OutPoint{input.previous_txid, input.previous_index});
-            add_outputs(next, tx, block_height, false);
-        }
-
-        const auto reward = emission::reward_at(block_height);
-        const auto shares = emission::split_reward(reward);
-        const auto expected_miner_value = shares.miner + fees;
-        if (expected_miner_value > transaction::max_amount || output_total(coinbase.outputs) != expected_miner_value)
-            throw std::invalid_argument("Coinbase does not pay exactly the Phase-1 miner share plus fees");
-        next.pools = emission::accrue_pools(parent.state.pools, reward);
-
-        const auto ordered = merkle::sorted_events(block.events);
-        if (ordered.size() != block.events.size())
-            throw std::invalid_argument("Event sorting changed event count");
+        const auto ordered = merkle::sorted_events(parts.events);
         for (std::size_t i = 0; i < ordered.size(); ++i)
         {
-            if (ordered[i].type != block.events[i].type || ordered[i].id != block.events[i].id ||
-                ordered[i].body != block.events[i].body)
+            if (ordered[i].type != parts.events[i].type || ordered[i].id != parts.events[i].id || ordered[i].body != parts.events[i].body)
                 throw std::invalid_argument("Block events are not in canonical (type, ID) order");
-            if (ordered[i].type == 0x02)
-                throw std::invalid_argument("Rad events are disabled until Phase 2 activation");
-            if (ordered[i].type != block_qtl::event_type)
-                throw std::invalid_argument("Unknown block event type");
+            if (ordered[i].type == 0x02) throw std::invalid_argument("Rad events are disabled until Phase 2 activation");
+            if (ordered[i].type != block_qtl::event_type) throw std::invalid_argument("Unknown block event type");
+            size += encode_event(ordered[i]).size();
         }
-        block_qtl::validate_block_events(block.events, block_qtl::provisional_z_commit);
-        if (merkle::event_root(block.events) != block.header.event_root)
+        block_qtl::validate_block_events(parts.events, block_qtl::provisional_z_commit);
+        if (merkle::event_root(parts.events) != parts.header.event_root)
             throw std::invalid_argument("Block event_root mismatch");
-        for (const auto &event : block.events)
-        {
-            if (event.type == block_qtl::event_type)
-            {
-                Commitment key{};
-                std::copy(event.id.begin(), event.id.end(), key.begin());
-                next.commitments[key].push_back({event, block_height});
-            }
-        }
-        next.recent_times.push_back(block.header.time);
-        if (next.recent_times.size() > 11)
-            next.recent_times.erase(next.recent_times.begin(), next.recent_times.end() - 11);
+        if (size > 4'000'000) throw std::invalid_argument("Block exceeds 4,000,000-byte size limit");
+        return size;
+    }
 
-        const auto parent_work = parent.chainwork;
-        const auto cumulative_work = add_work(parent_work, block_work(block.header.bits));
-        if (write_record)
-            persist(block, block_height, id);
-        IndexEntry entry{block, id, parent.id, block_height, cumulative_work, std::move(next), size};
-        auto inserted = entries.emplace(id, std::move(entry));
-        index_block(id);
-        if (compare_work(inserted.first->second.chainwork, entries.at(best).chainwork) > 0)
-            best = id;
-        return make_info(inserted.first->second);
+    BlockInfo accept_record (Bytes raw, std::uint64_t adjusted_time, bool write_record)
+    {
+        const auto parts = record_parts(raw);
+        const auto &header = parts.header;
+        const auto parent_it = entries.find(header.prev_block);
+        if (parent_it == entries.end()) throw std::invalid_argument("Block parent is unknown");
+        const auto &parent = parent_it->second;
+        const auto id = addresses::block_id(chain::serialize_header(header));
+        if (const auto known = entries.find(id); known != entries.end())
+            throw std::invalid_argument(known->second.invalid ? "Block is known invalid" : "Block is already known");
+        if (write_record && parent.invalid) throw std::invalid_argument("Block descends from an invalid branch");
+        if (parent.height == UINT64_MAX) throw std::overflow_error("Block height overflow");
+        const auto height = parent.height + 1;
+        checkpoints::validate_testnet(height, id);
+        const auto expected = chain::asert_bits(genesis_bits, 0, genesis_time - chain::target_spacing,
+                                                parent.height, parent.header.time);
+        if (header.bits != expected) throw std::invalid_argument("Block bits do not match ASERT");
+        if (!chain::check_block_time(header.time, ancestor_times(parent.id), adjusted_time))
+            throw std::invalid_argument("Block time violates median-time-past or future-time limit");
+        if (!chain::check_header_pow(header)) throw std::invalid_argument("Block proof of work is invalid");
+        const auto size = check_body_without_coins(parts, height);
+        IndexEntry entry{header, {raw.begin(), raw.end()}, id, parent.id, height,
+            add_work(parent.chainwork, block_work(header.bits)),
+            emission::accrue_pools(parent.pools, emission::reward_at(height)), size, false, parent.invalid};
+        if (!write_record && std::filesystem::exists(rejection_path(id)))
+        {
+            std::ifstream in(rejection_path(id));
+            std::string fingerprint; std::getline(in, fingerprint);
+            if (!in || fingerprint != hex(shake::shake256_tagged_256("E46-rejected-record", raw)))
+                throw std::invalid_argument("Rejected block record or metadata is damaged");
+            entry.invalid = true;
+        }
+        if (write_record) check_disk_floor();
+        auto &stored = entries.emplace(id, std::move(entry)).first->second;
+        const auto original = best;
+        if (!stored.invalid) activate(id, write_record);
+        try
+        {
+            if (write_record) persist_raw(raw, height, id);
+        }
+        catch (...)
+        {
+            if (best != original) activate(original, false, true);
+            for (auto it = tx_index.begin(); it != tx_index.end();)
+            {
+                std::erase_if(it->second, [&](const auto &location) { return location.first == id; });
+                if (it->second.empty()) it = tx_index.erase(it); else ++it;
+            }
+            entries.erase(id);
+            throw;
+        }
+        if (stored.validated && !stored.invalid) return make_info(stored);
+        // Deferred branch admission has only a header until activation. Public
+        // get_block refuses to present its body as a fully validated block.
+        return {Block{header, {}, {}}, id, height, stored.pools, stored.size};
+    }
+
+    BlockInfo accept_internal (const Block &block, std::uint64_t adjusted_time, bool write_record)
+    {
+        return accept_record(store_record(block), adjusted_time, write_record);
     }
 
     const std::vector<Digest> &best_chain_ids () const
@@ -994,28 +1294,28 @@ struct Node::Impl
         return active_cache;
     }
 
-    void index_block (const Digest &id)
+    void index_block (const Digest &id, const Block &block)
     {
-        const auto &transactions = entries.at(id).block.transactions;
+        const auto &transactions = block.transactions;
         for (std::size_t i = 0; i < transactions.size(); ++i)
             tx_index[transaction::txid(transactions[i])].emplace_back(id, static_cast<std::uint32_t>(i));
     }
 
     // The active-chain copy of a confirmed transaction, or nullptr.
-    const transaction::Transaction *active_transaction (const Digest &txid) const
+    std::optional<std::pair<Digest, std::uint32_t>> active_transaction (const Digest &txid) const
     {
         const auto found = tx_index.find(txid);
         if (found == tx_index.end())
-            return nullptr;
+            return std::nullopt;
         const auto &active = best_chain_ids();
         for (const auto &[block_id, position] : found->second)
         {
             const auto &entry = entries.at(block_id);
             const auto height = static_cast<std::size_t>(entry.height);
             if (height < active.size() && active[height] == block_id)
-                return &entry.block.transactions[position];
+                return std::pair{block_id, position};
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     const IndexEntry &active_tip () const
@@ -1063,10 +1363,10 @@ struct Node::Impl
             throw std::invalid_argument("Cannot submit a coinbase transaction");
         const auto &tip = active_tip();
         const auto candidate_height = tip.height + 1;
-        const auto spent = spent_for(refs, tip.state);
+        const auto spent = spent_for(refs, tip_state);
         const auto tx = transaction::deserialize(raw, spent);
         transaction::validate_transaction(tx, spent, candidate_height);
-        validate_tx_lock(tx, tip.state, candidate_height);
+        validate_tx_lock(tx, tip_state, candidate_height);
         for (const auto &output : tx.outputs)
         {
             if (output.type == 0x02 && !phase2_activation_height)
@@ -1093,7 +1393,7 @@ struct Node::Impl
         entry.qtl = has_qtl_input(tx);
         if (entry.qtl)
         {
-            const auto existing = find_any_commitment(tx, tip.state);
+            const auto existing = find_any_commitment(tx, tip_state);
             if (existing)
             {
                 if (candidate_height - existing->height <= block_qtl::max_reveal_depth)
@@ -1123,7 +1423,7 @@ struct Node::Impl
     {
         const auto block_height = parent.height + 1;
         Block block{};
-        std::uint64_t timestamp = std::max(now_seconds(), median_time(parent.state.recent_times) + 1);
+        std::uint64_t timestamp = std::max(now_seconds(), median_time(tip_state.recent_times) + 1);
         if (timestamp > now_seconds() + chain::max_future_seconds)
             throw std::runtime_error("Local clock is behind median-time-past by more than the future limit");
 
@@ -1135,9 +1435,9 @@ struct Node::Impl
                 bool spendable = true;
                 try
                 {
-                    const auto spent = spent_for(entry.inputs, parent.state);
+                    const auto spent = spent_for(entry.inputs, tip_state);
                     transaction::validate_transaction(entry.tx, spent, block_height);
-                    validate_tx_lock(entry.tx, parent.state, block_height);
+                    validate_tx_lock(entry.tx, tip_state, block_height);
                 }
                 catch (const std::exception &)
                 {
@@ -1150,14 +1450,14 @@ struct Node::Impl
                     included_mempool.push_back(i);
                     continue;
                 }
-                const auto any_commitment = find_any_commitment(entry.tx, parent.state);
+                const auto any_commitment = find_any_commitment(entry.tx, tip_state);
                 if (entry.commit_event && !any_commitment)
                 {
                     block.events.push_back(*entry.commit_event);
                     new_commit_events.push_back(i);
                     continue;
                 }
-                const auto committed = find_commitment(entry.tx, parent.state, block_height);
+                const auto committed = find_commitment(entry.tx, tip_state, block_height);
                 if (committed)
                     included_mempool.push_back(i);
                 else if (any_commitment)
@@ -1185,7 +1485,7 @@ struct Node::Impl
         {
             const auto &tx = mempool[index].tx;
             const auto refs = mempool[index].inputs;
-            const auto spent = spent_for(refs, parent.state);
+            const auto spent = spent_for(refs, tip_state);
             std::uint64_t in = 0;
             for (const auto &coin : spent)
                 checked_sum(in, coin.output.value);
@@ -1226,7 +1526,7 @@ struct Node::Impl
         block.header.event_root = merkle::event_root(block.events);
         block.header.time = timestamp;
         block.header.bits = chain::asert_bits(genesis_bits, 0, genesis_time - chain::target_spacing,
-                                              parent.height, parent.block.header.time);
+                                              parent.height, parent.header.time);
         block.header.nonce = 0;
         return block;
     }
@@ -1281,13 +1581,14 @@ struct Node::Impl
         const auto parent_it = entries.find(parent_id);
         if (parent_it == entries.end())
             throw std::invalid_argument("Cannot mine on an unknown parent");
+        if (parent_id != best) throw std::invalid_argument("mine_on requires the active tip; use a separate datadir for branch mining");
         std::vector<std::size_t> included;
         std::vector<std::size_t> new_commits;
         auto block = make_candidate(parent_it->second, miner, included, new_commits);
         if (time)
         {
             block.header.time = *time;
-            if (block.header.time <= median_time(parent_it->second.state.recent_times))
+            if (block.header.time <= median_time(tip_state.recent_times))
                 throw std::invalid_argument("Requested mining time is not later than median-time-past");
         }
         mine_header(block, workers);
@@ -1351,14 +1652,35 @@ Node &Node::operator= (Node &&other) noexcept
     return *this;
 }
 
+StorageStats Node::storage_stats () const
+{
+    StorageStats stats{};
+    stats.tip_coins = impl_->tip_state.utxos.size();
+    stats.undo_records = impl_->undo.size();
+    stats.indexed_blocks = impl_->entries.size();
+    stats.validation_attempts = impl_->validation_attempts;
+    for (const auto &[id, changes] : impl_->undo)
+    {
+        (void)id;
+        for (const auto &[point, coin] : changes.coins)
+        {
+            (void)point;
+            if (coin) ++stats.undo_saved_coins; else ++stats.undo_created_outputs;
+        }
+    }
+    for (const auto &[id, entry] : impl_->entries)
+    { (void)id; if (entry.invalid) ++stats.invalid_blocks; }
+    return stats;
+}
+
 std::uint64_t Node::height () const { return impl_->active_tip().height; }
 Digest Node::tip_id () const { return impl_->best; }
-emission::PoolBalances Node::pool_balances () const { return impl_->active_tip().state.pools; }
+emission::PoolBalances Node::pool_balances () const { return impl_->tip_state.pools; }
 
 std::uint64_t Node::balance (const AddressPayload &address) const
 {
     std::uint64_t total = 0;
-    for (const auto &[outpoint, coin] : impl_->active_tip().state.utxos)
+    for (const auto &[outpoint, coin] : impl_->tip_state.utxos)
     {
         (void)outpoint;
         if (coin.output.type == 0x00 && coin.output.payload.size() == address.size() &&
@@ -1373,7 +1695,7 @@ std::vector<OwnedCoin> Node::coins (const AddressPayload &address) const
     const auto &tip = impl_->active_tip();
     const auto spending_height = tip.height + 1;
     std::vector<OwnedCoin> result;
-    for (const auto &[outpoint, coin] : tip.state.utxos)
+    for (const auto &[outpoint, coin] : impl_->tip_state.utxos)
     {
         if (coin.output.type != 0x00 || coin.output.payload.size() != address.size() ||
             !std::equal(coin.output.payload.begin(), coin.output.payload.end(), address.begin()))
@@ -1405,8 +1727,8 @@ BlockInfo Node::get_block (const Digest &id) const
 
 std::optional<transaction::Transaction> Node::get_transaction (const Digest &txid) const
 {
-    if (const auto *tx = impl_->active_transaction(txid))
-        return *tx;
+    if (const auto tx = impl_->active_transaction(txid))
+        return impl_->historical_block(impl_->entries.at(tx->first)).transactions.at(tx->second);
     for (const auto &entry : impl_->mempool)
         if (entry.txid == txid)
             return entry.tx;
@@ -1471,9 +1793,10 @@ BlockInfo Node::accept (const Block &block, std::uint64_t adjusted_time)
         while (!active.contains(old))
         {
             const auto &entry = impl_->entries.at(old);
-            for (std::size_t i = 1; i < entry.block.transactions.size(); ++i)
+            const auto block = impl_->historical_block(entry);
+            for (std::size_t i = 1; i < block.transactions.size(); ++i)
             {
-                try { (void)impl_->submit_tx(transaction::serialize(entry.block.transactions[i]), true, {}, false); }
+                try { (void)impl_->submit_tx(transaction::serialize(block.transactions[i]), true, {}, false); }
                 catch (const std::exception &) { /* Conflicting/non-final disconnected spend. */ }
             }
             old = entry.parent;
@@ -1516,13 +1839,44 @@ std::string Node::submit_relay (shake::Bytes raw, const Digest &id)
 }
 std::vector<std::uint8_t> Node::block_record (const Digest &id) const
 {
-    return store_record(impl_->entries.at(id).block);
+    const auto &entry = impl_->entries.at(id);
+    if (entry.invalid) throw std::invalid_argument("Block is known invalid");
+    return entry.raw;
 }
 BlockInfo Node::import_record (shake::Bytes raw)
 {
-    if (raw.size() > 4'100'000) throw std::invalid_argument("Block record exceeds transport limit");
-    return accept(impl_->decode_record(raw), now_seconds());
+    const auto previous = impl_->best;
+    const auto result = impl_->accept_record(raw, now_seconds(), true);
+    if (impl_->best != previous)
+    {
+        // Revalidate pending spends after extensions/reorgs and resurrect ordinary
+        // transactions disconnected from the previous active branch.
+        auto pending = std::move(impl_->mempool);
+        impl_->mempool.clear();
+        impl_->mempool_spends.clear();
+        for (const auto &entry : pending)
+        {
+            try { (void)impl_->submit_tx(entry.raw, false, {}, false, &entry.commit_event); }
+            catch (const std::exception &) { impl_->erase_pending(entry.txid); }
+        }
+        auto old = previous;
+        std::set<Digest> active;
+        for (const auto &id : impl_->best_chain_ids()) active.insert(id);
+        while (!active.contains(old))
+        {
+            const auto &entry = impl_->entries.at(old);
+            const auto block = impl_->historical_block(entry);
+            for (std::size_t i = 1; i < block.transactions.size(); ++i)
+            {
+                try { (void)impl_->submit_tx(transaction::serialize(block.transactions[i]), true, {}, false); }
+                catch (const std::exception &) { /* Conflicting/non-final disconnected spend. */ }
+            }
+            old = entry.parent;
+        }
+    }
+    return result;
 }
+
 void Node::check_peer_block (shake::Bytes raw) const
 {
     if (raw.size() < 8 + rl::header_bytes)

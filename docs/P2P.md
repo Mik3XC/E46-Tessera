@@ -163,7 +163,7 @@ There is no validation bypass and no checkpoint bypass.
 | Incoming block/transaction validation admission | One at a time; at least 25 ms between starts globally |
 | Outstanding requests per peer | One block and one transaction |
 | Mempool | 1,000 transactions / 64 MiB |
-| Stored blocks in daemon experiment | 4,096 including side branches |
+| Active-chain block count | No count ceiling; the disk floor still applies |
 | Side-branch blocks from peers | 512; active-chain blocks never count against it |
 | Side branches below a held checkpoint | refused (they can never become active) |
 | Disk floor | Existing 1 GiB minimum free space |
@@ -173,11 +173,14 @@ Malformed/unexpected traffic closes the connection. No unbounded orphan queue
 is maintained. Validation admission limits frequency; it does not interrupt an
 individual cryptographic check. Valid maximum-size blocks can still take time.
 
-The existing engine retains a UTXO snapshot per block, so memory grows much
-faster than a production chain database. The experimental block-count ceiling
-is a transport/daemon safeguard, not a consensus rule or a memory guarantee.
-Before an unrestricted public seed, improve state storage, benchmark adversarial
-validation costs, and review connection admission/peer diversity. This version
+The engine holds one active-tip coin set and commitment set. Active blocks have
+undo records containing only changed coins, added commitments, and prior pool
+balances and recent times. Headers, raw block records and transaction locations
+are indexed separately. Memory is linear in stored records plus live coins and
+undo changes; it is not bounded independently of chain size. There is no total
+block-count ceiling. The peer side-branch budget and disk floor still apply.
+Before an unrestricted public seed, benchmark adversarial validation costs and
+review connection admission/peer diversity. This version
 has no transport encryption, peer authentication, address gossip, bans persisted
 across reconnects, automatic discovery, or public RPC.
 
@@ -245,3 +248,55 @@ access the operator's real default datadir:
 ```sh
 python3 tests/datadir_defaults.py --node build/dev/e46-node
 ```
+
+## Storage replay and branch checks
+
+Side branches first receive all checks possible without parent coins: framing,
+header ancestry/time, checkpoint, ASERT, proof of work, transaction roots,
+coinbase commitment, events and size. Their witnesses and spends are fully
+validated only when their cumulative work exceeds the active tip. Equal work
+keeps the current tip. A failed switch disconnects its partial changes and
+reconnects the original chain before returning an error. The failing block and
+its descendants are marked invalid and the reason is logged.
+
+Local `rejected/` metadata binds previously rejected stored records to their
+exact bytes, so they remain excluded across restart without deleting evidence.
+A changed record or damaged rejection marker fails replay. Missing block parents,
+malformed records and validation failures without prior rejection metadata also
+fail replay. Rejection metadata is local storage bookkeeping, not a network
+message or a checkpoint. Keep it with the datadir when moving a store.
+
+`getblock` refuses to expose an unvalidated side-branch body as verified data.
+The library's `mine_on` requires the active tip; use independent datadirs to mine
+competing branches. Public command names and active-chain output formats remain
+unchanged, as does the `E46NDB01` block record.
+
+The optional storage test tool is built with:
+
+```sh
+cmake --preset dev -DE46_BUILD_STORAGE_TESTS=ON
+cmake --build --preset dev
+python3 tests/storage_replay.py --old /path/to/old/e46-node \
+  --new build/dev/e46-node --chain /path/to/copied-fixture --output /tmp/replay-check
+./build/dev/e46-storage-checks stats /path/to/copied-fixture
+```
+
+`storage_replay.py` copies its input fixture into independent stores and compares
+all blocks 0–273, snapshot, mempool, and balances/UTXOs for every single-owner
+address found in the fixture. It reports startup RSS in KiB and checks record
+bytes. It binds only localhost and shuts down its child daemons.
+
+Generating reorg fixtures mines five blocks at the unchanged testnet target.
+It can take more than ten minutes; obtain operator approval first. The timeout
+below is a wall-clock cap for generation, and completed fixtures can be reused:
+
+```sh
+./build/dev/e46-storage-checks generate /tmp/branch-fixtures /path/to/copied-fixture 2700
+python3 tests/storage_reorg.py --tool build/dev/e46-storage-checks \
+  --node build/dev/e46-node --fixtures /tmp/branch-fixtures --output /tmp/branch-check
+```
+
+The checks cover a one-block switch, a two-block disconnect, rollback after an
+invalid second branch block, no retry of known-invalid blocks, balances, exact
+snapshot restoration, restart/rebuild and active-only undo counts. Reuse the
+same mined fixtures with the sanitizer build (`ASAN_OPTIONS=detect_leaks=0`).

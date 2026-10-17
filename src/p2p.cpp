@@ -249,10 +249,6 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
     peers.reserve(options.max_peers + 4);
     auto last_connect = Clock::now() - std::chrono::seconds(10);
     std::uint64_t accepted_blocks = 0, accepted_txs = 0, rejected = 0;
-    std::size_t stored_blocks = 0;
-    for (const auto &entry : std::filesystem::directory_iterator(directory / "blocks"))
-        if (entry.path().extension() == ".blk") ++stored_blocks;
-    require(stored_blocks <= 4096, "Experimental daemon supports at most 4096 stored blocks");
     std::atomic<bool> mine_done{false};
     node::Block mining_block{};
     std::uint64_t mining_remaining = 0;
@@ -309,9 +305,8 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
             mine_done.store(false);
             try
             {
-                require(stored_blocks < 4096, "Experimental stored-block limit reached");
                 const auto info = node.import_record(node::encode_record(mining_block));
-                ++stored_blocks; ++accepted_blocks; --mining_remaining;
+                ++accepted_blocks; --mining_remaining;
                 std::cerr << "Mined height " << info.height << '\n';
                 accepted_tip();
             }
@@ -442,10 +437,9 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
                         {
                             require(args[0] != "serve" && args[0] != "rebuild", "Stop the daemon before rebuilding");
                             const auto before = node.tip_id();
-                            if (args[0] == "import") require(stored_blocks < 4096, "Experimental stored-block limit reached");
                             response = handler(args);
                             if (args[0] == "submit") { ++accepted_txs; announce_pool(); }
-                            if (args[0] == "import") { ++stored_blocks; ++accepted_blocks; }
+                            if (args[0] == "import") { ++accepted_blocks; }
                             if (node.tip_id() != before) accepted_tip();
                         }
                         queue_text(peer, result, response);
@@ -478,9 +472,8 @@ void serve(node::Node &node, const std::filesystem::path &directory, const Optio
                     {
                         last_validation = now;  // only real validation work takes the global slot
                         node.check_peer_block(data);  // no cheap side branches filling the store
-                        require(stored_blocks < 4096, "Experimental stored-block limit reached");
                         const auto before = node.tip_id();
-                        node.import_record(data); ++accepted_blocks; ++stored_blocks;
+                        node.import_record(data); ++accepted_blocks;
                         if (node.tip_id() != before) accepted_tip();
                     }
                     peer.cursor = id; peer.block_pending = false; sync(peer);
