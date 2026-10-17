@@ -340,8 +340,16 @@ int dispatch(e46::node::Node &node, int argc, char **argv, bool p2p)
                       << "\nbits " << info.block.header.bits
                       << "\ntime " << info.block.header.time
                       << "\nmerkle_root " << hex(info.block.header.merkle_root)
-                      << "\nevent_root " << hex(info.block.header.event_root)
-                      << "\ntransactions " << info.block.transactions.size()
+                      << "\nevent_root " << hex(info.block.header.event_root);
+            if (!info.body_available)
+            {
+                // Side-branch block: only the header can be shown off the active chain.
+                std::cout << "\nbranch side" << (info.rejected ? " (rejected: its branch failed validation)" : "")
+                          << "\nbody unavailable: a side-branch block needs its branch's coin set to decode"
+                          << "\nrecord_size " << info.serialized_size << '\n';
+                return 0;
+            }
+            std::cout << "\ntransactions " << info.block.transactions.size()
                       << "\nevents " << info.block.events.size()
                       << "\nserialized_size " << info.serialized_size << '\n';
             for (const auto &tx : info.block.transactions)

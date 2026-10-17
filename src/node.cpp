@@ -788,7 +788,16 @@ struct Node::Impl
     {
         const auto found = tx_index.find(ref.txid);
         if (found == tx_index.end()) throw std::invalid_argument("Historical transaction is unavailable");
-        const auto &[id, pos] = found->second.front();
+        // Prefer the copy on the active chain; a disconnected block may hold the
+        // same transaction at a different height.
+        const auto &active = best_chain_ids();
+        auto chosen = found->second.front();
+        for (const auto &occurrence : found->second)
+        {
+            const auto height = static_cast<std::size_t>(entries.at(occurrence.first).height);
+            if (height < active.size() && active[height] == occurrence.first) { chosen = occurrence; break; }
+        }
+        const auto &[id, pos] = chosen;
         const auto &entry = entries.at(id);
         const auto parts = record_parts(entry.raw);
         return {recorded_output(parts.transactions.at(pos), ref.index), pos == 0, entry.height};
@@ -1122,11 +1131,20 @@ struct Node::Impl
 
     void mark_invalid (const Digest &failed, const std::string &reason, bool persist_rejection)
     {
-        for (auto &[id, entry] : entries)
+        // Descendants of the failed block, found in one pass ordered by height
+        // (a parent is always lower), instead of walking each block to genesis.
+        std::vector<IndexEntry *> by_height;
+        by_height.reserve(entries.size());
+        for (auto &[id, entry] : entries) by_height.push_back(&entry);
+        std::sort(by_height.begin(), by_height.end(),
+                  [] (const IndexEntry *a, const IndexEntry *b) { return a->height < b->height; });
+        std::set<Digest> doomed{failed};
+        for (auto *candidate : by_height)
         {
-            auto cursor = id;
-            while (entries.at(cursor).height && cursor != failed) cursor = entries.at(cursor).parent;
-            if (cursor != failed) continue;
+            if (candidate->id != failed && !doomed.contains(candidate->parent)) continue;
+            doomed.insert(candidate->id);
+            auto &entry = *candidate;
+            const auto &id = entry.id;
             entry.invalid = true;
             if (persist_rejection && std::filesystem::exists(blocks_directory / block_filename(entry.height, id)))
             {
@@ -1730,7 +1748,17 @@ BlockInfo Node::get_block (const Digest &id) const
     const auto found = impl_->entries.find(id);
     if (found == impl_->entries.end())
         throw std::out_of_range("Unknown block ID");
-    return impl_->make_info(found->second);
+    const auto &entry = found->second;
+    if (entry.validated && !entry.invalid)
+        return impl_->make_info(entry);
+    BlockInfo header_only{};
+    header_only.block.header = entry.header;
+    header_only.id = entry.id;
+    header_only.height = entry.height;
+    header_only.serialized_size = entry.raw.size();
+    header_only.body_available = false;
+    header_only.rejected = entry.invalid;
+    return header_only;
 }
 
 std::optional<transaction::Transaction> Node::get_transaction (const Digest &txid) const

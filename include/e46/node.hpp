@@ -45,6 +45,10 @@ struct BlockInfo
     std::uint64_t height{};
     emission::PoolBalances pools{};
     std::size_t serialized_size{};
+    // False for a side-branch block: its body needs that branch's coin set to
+    // decode, so only the header (block.header) is filled in.
+    bool body_available{true};
+    bool rejected{};  // its branch failed validation
 };
 
 // Storage diagnostics used by regression tools; no wire or CLI format changes.

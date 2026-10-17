@@ -269,7 +269,10 @@ malformed records and validation failures without prior rejection metadata also
 fail replay. Rejection metadata is local storage bookkeeping, not a network
 message or a checkpoint. Keep it with the datadir when moving a store.
 
-`getblock` refuses to expose an unvalidated side-branch body as verified data.
+`getblock ID` on a side-branch block prints its header (height, id, prev, bits, time,
+roots), then `branch side` (marked rejected if its branch failed validation), a
+`body unavailable` line and `record_size`: decoding a side block's body needs that
+branch's coin set, which only exists while the branch is active.
 The library's `mine_on` requires the active tip; use independent datadirs to mine
 competing branches. Public command names and active-chain output formats remain
 unchanged, as does the `E46NDB01` block record.
